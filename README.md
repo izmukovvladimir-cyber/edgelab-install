@@ -81,7 +81,7 @@ Gateway работает как systemd-сервис, получает сооб�
   settings.json                # 400K context + permissions
   plugins/                     # Superpowers и другие плагины
     config.json                # реестр плагинов
-    superpowers/               # git clone pcvelz/superpowers
+    superpowers/               # git clone izmukovvladimir-cyber/superpowers
   mcp.json                     # Day-2 expansion point
 
 ~/.claude-lab/{agent}/.claude/ # Agent workspace (например, jarvis)
@@ -116,7 +116,7 @@ Gateway работает как systemd-сервис, получает сооб�
     groq-api-key               # (опционально)
 ```
 
-Для продвинутой архитектуры с памятью, скиллами и автоматизацией смотрите: [public-architecture-claude-code](https://github.com/qwwiwi/public-architecture-claude-code)
+Для продвинутой архитектуры с памятью, скиллами и автоматизацией смотрите: [public-architecture-claude-code](https://github.com/izmukovvladimir-cyber/public-architecture-claude-code)
 
 ```
 ~/.claude/                     # Продвинутая архитектура (опционально)
