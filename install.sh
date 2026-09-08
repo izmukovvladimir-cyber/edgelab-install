@@ -4,8 +4,8 @@
 # Installs on a fresh Ubuntu 22.04 / 24.04 VPS:
 #   - edgelab user (dedicated, non-login-privileged)
 #   - Node.js 22 + Python 3.12 + Claude Code CLI
-#   - Jarvis: qwwiwi/jarvis-telegram-gateway -> systemd unit claude-gateway
-#   - Richard: RichardAtCT/claude-code-telegram v1.6.0 -> systemd unit claude-richard
+#   - Jarvis: izmukovvladimir-cyber/jarvis-telegram-gateway -> systemd unit claude-gateway
+#   - Richard: izmukovvladimir-cyber/claude-code-telegram v1.6.0 -> systemd unit claude-richard
 #
 # Both agents share Anthropic Max OAuth from /home/edgelab/.claude/
 # Operator runs `sudo -u edgelab claude login` once after install finishes.
@@ -32,18 +32,18 @@ set -euo pipefail
 # =============================================================================
 
 readonly EDGELAB_VERSION="3.0.3"
-readonly JARVIS_REPO="https://github.com/qwwiwi/jarvis-telegram-gateway.git"
+readonly JARVIS_REPO="https://github.com/izmukovvladimir-cyber/jarvis-telegram-gateway.git"
 readonly JARVIS_DIR_NAME="claude-gateway"
-readonly RICHARD_REPO_SPEC="git+https://github.com/RichardAtCT/claude-code-telegram@v1.6.0"
+readonly RICHARD_REPO_SPEC="git+https://github.com/izmukovvladimir-cyber/claude-code-telegram@v1.6.0"
 readonly RICHARD_HOME="/opt/richard"
 readonly NODE_MAJOR="22"
 readonly EDGELAB_USER="edgelab"
 readonly EDGELAB_HOME="/home/edgelab"
 
 # Template bundle (inherited from v2.2.6 -- pinned SHAs for supply chain).
-readonly TEMPLATE_REPO="https://github.com/qwwiwi/public-architecture-claude-code.git"
+readonly TEMPLATE_REPO="https://github.com/izmukovvladimir-cyber/public-architecture-claude-code.git"
 readonly TEMPLATE_SHA="93cc7ddf10c03472616a3a32ff7e6ac731ebe6f2"
-readonly SUPERPOWERS_REPO="https://github.com/pcvelz/superpowers.git"
+readonly SUPERPOWERS_REPO="https://github.com/izmukovvladimir-cyber/superpowers.git"
 readonly SUPERPOWERS_SHA="04bad33282e792ecfd1007a138331f1e6b288eed"
 
 # 6 skills from template + 4 bundled with installer = 10 total (prod parity).
@@ -272,7 +272,7 @@ locate_installer_skills() {
     dir=$(mktemp -d)
     TMPDIRS+=("$dir")
     log "Cloning installer bundled skills..." >&2
-    if ! git clone --quiet --depth 1 "https://github.com/qwwiwi/edgelab-install.git" "$dir" >&2; then
+    if ! git clone --quiet --depth 1 "https://github.com/izmukovvladimir-cyber/edgelab-install.git" "$dir" >&2; then
         err "Failed to clone installer repo for bundled skills."
         return 1
     fi
@@ -399,13 +399,13 @@ preflight() {
         TMPDIRS+=("$clone_dir")
         log "Templates not found at ${TEMPLATES_DIR}; cloning installer repo..."
         if ! git clone --quiet --depth 1 --branch "${EDGELAB_INSTALL_REF:-main}" \
-                https://github.com/qwwiwi/edgelab-install.git "$clone_dir"; then
+                https://github.com/izmukovvladimir-cyber/edgelab-install.git "$clone_dir"; then
             warn "Clone of branch ${EDGELAB_INSTALL_REF:-main} failed; falling back to default branch."
             rm -rf "$clone_dir"
             clone_dir=$(mktemp -d)
             TMPDIRS+=("$clone_dir")
             git clone --quiet --depth 1 \
-                https://github.com/qwwiwi/edgelab-install.git "$clone_dir" \
+                https://github.com/izmukovvladimir-cyber/edgelab-install.git "$clone_dir" \
                 || die "Failed to clone installer repo for templates/skills."
         fi
         TEMPLATES_DIR="${clone_dir}/templates"
