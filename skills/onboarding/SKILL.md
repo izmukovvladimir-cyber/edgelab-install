@@ -11,7 +11,7 @@ classifier stack arrives on Day-N.
 
 ## When to use
 
-- Operator just ran `curl -fsSL https://edgelab.su/install | sudo bash`.
+- Operator just ran `curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-install/main/install.sh -o install.sh && sudo bash install.sh`.
 - Operator asks to redo onboarding after changing their role / timezone.
 - USER.md or CLAUDE.md still has installer defaults (e.g. `boss`, `UTC`, `jarvis`).
 

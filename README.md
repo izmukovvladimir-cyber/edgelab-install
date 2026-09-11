@@ -7,7 +7,7 @@
 ## Установка
 
 ```bash
-curl -fsSL https://edgelab.su/install | sudo bash
+curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-install/main/install.sh -o install.sh && sudo bash install.sh
 ```
 
 ## Что устанавливается
