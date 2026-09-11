@@ -11,7 +11,7 @@
 # Operator runs `sudo -u edgelab claude login` once after install finishes.
 #
 # Usage:
-#   curl -fsSL https://edgelab.su/install | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-install/main/install.sh -o install.sh && sudo bash install.sh
 #   # or
 #   sudo ./install.sh
 #
