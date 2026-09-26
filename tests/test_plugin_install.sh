@@ -482,6 +482,80 @@ check "apt deps: installs a missing one"  bash -c "grep -E '^install' '$APT_LOG'
 check "apt deps: every install is --no-upgrade" bash -c "! grep -E '^install' '$APT_LOG' | grep -vq -- '--no-upgrade'"
 unset -f dpkg-query apt_get
 
+# --- apt: pure-python upgrades allowed along the way, nothing else --------------
+dpkg-query() { return 1; }    # nothing of the test packages is installed
+apt_get() {
+    if [[ " $* " == *" -s "* ]]; then
+        local a
+        for a in "$@"; do
+            case $a in
+                python3-venv) printf 'Inst python3-setuptools [68.1.2-2ubuntu1.1] (68.1.2-2ubuntu1.2 Ubuntu [all])\nInst python3-pkg-resources [68.1.2-2ubuntu1.1] (68.1.2-2ubuntu1.2 Ubuntu [all])\nInst python3-venv (3.12 Ubuntu [amd64])\n' ;;
+                mixpkg) printf 'Inst python3-setuptools [1] (2 Ubuntu [all])\nInst libc6 [1] (2 Ubuntu [amd64])\n' ;;
+                rmpkg)  printf 'Remv python3-wheel [1]\nInst rmpkg (1 Ubuntu [all])\n' ;;
+                failpkg) printf 'Inst failpkg (1 Ubuntu [all])\n' ;;
+            esac
+        done
+        return 0
+    fi
+    [[ " $* " == *" failpkg "* ]] && return 100
+    printf '%s\n' "$*" >>"$APT_LOG"
+}
+: >"$APT_LOG"; APT_SKIPPED=()
+OUT=$(apt_install_missing python3-venv 2>&1; printf '\nskipped=[%s]' "${APT_SKIPPED[*]}")
+check "allowlist: venv installed"              grep -qx 'install -y -qq --no-upgrade python3-venv' "$APT_LOG"
+check "allowlist: one line about upgrades"     grep -q 'попутно обновлены: python3-pkg-resources python3-setuptools$' <<<"$OUT"
+check "allowlist: nothing skipped"             grep -q 'skipped=\[\]' <<<"$OUT"
+: >"$APT_LOG"
+OUT=$(apt_install_missing mixpkg 2>&1; printf '\nskipped=[%s]' "${APT_SKIPPED[*]}")
+check "allowlist: libc6 still blocks"          test ! -s "$APT_LOG"
+check "allowlist: warn names only libc6"       grep -q 'mixpkg NOT installed.*: libc6\.' <<<"$OUT"
+check "allowlist: skipped recorded"            grep -q 'skipped=\[mixpkg\]' <<<"$OUT"
+: >"$APT_LOG"
+OUT=$(apt_install_missing rmpkg 2>&1)
+check "allowlist: removal never excused"       test ! -s "$APT_LOG"
+check "allowlist: removal named"               grep -q 'remove:python3-wheel' <<<"$OUT"
+R5=$( (apt_install_missing failpkg >/dev/null 2>&1; printf 'rc=%s' "$?") )
+check "apt: real install failure is fatal"     test "$R5" != "rc=0"
+unset -f apt_get dpkg-query
+
+# --- required packages: stop before any agent, re-run passes --------------------
+dpkg-query() {
+    local pkg=${*: -1}
+    if [[ "$INSTALLED" == *" ${pkg} "* ]]; then printf 'install ok installed'; else return 1; fi
+}
+INSTALLED=" ca-certificates curl git jq rsync sudo tmux unzip cron python3 "
+OUT=$( (require_step_packages) 2>&1; printf 'rc=%s' "$?" )
+check "gate: missing venv -> stop"             grep -q 'rc=1$' <<<"$OUT"
+check "gate: says nothing installed yet"       grep -q 'Stopped before installing the agents' <<<"$OUT"
+check "gate: ready command"                    grep -q 'sudo apt-get install python3-venv$' <<<"$OUT"
+INSTALLED="${INSTALLED}python3-venv "
+OUT=$( (require_step_packages) 2>&1; printf 'rc=%s' "$?" )
+check "gate: after apt-get -> passes"          test "$OUT" = "rc=0"
+
+# main: with the gate failing no agent step runs; re-run goes all the way
+STEPS="${TDIR}/steps"
+main_steps=(banner preflight install_apt_deps install_node ensure_edgelab_user check_node_for_edgelab
+    install_claude_cli install_bun collect_inputs install_jarvis install_richard setup_global_claude
+    install_skills install_superpowers install_sudoers install_memory_cron enable_services final_instructions)
+run_main_stubbed() {
+    (
+        for f in "${main_steps[@]}"; do eval "${f}() { echo ${f} >>'${STEPS}'; }"; done
+        main
+    ) >/dev/null 2>&1
+}
+INSTALLED=" ca-certificates curl git jq rsync sudo tmux unzip cron python3 "; : >"$STEPS"
+run_main_stubbed
+check "main: gate stops the run"               test $? -ne 0
+check "main: no Jarvis after stop"             bash -c "! grep -q install_jarvis '$STEPS'"
+check "main: no Richard after stop"            bash -c "! grep -q install_richard '$STEPS'"
+check "main: no user/claude/bun after stop"    bash -c "! grep -qE 'ensure_edgelab_user|install_claude_cli|install_bun' '$STEPS'"
+INSTALLED="${INSTALLED}python3-venv "; : >"$STEPS"
+run_main_stubbed
+check "main: re-run passes"                    test $? -eq 0
+check "main: re-run installs Jarvis+Richard"   bash -c "grep -q install_jarvis '$STEPS' && grep -q install_richard '$STEPS'"
+check "main: gate right after apt deps"        test "$(sed -n 3p "$STEPS")" = "install_apt_deps" -a "$(sed -n 4p "$STEPS")" = "install_node"
+unset -f dpkg-query
+
 # --- node: >= 22 left alone, older replaced, not-runnable-as-edgelab warns --------
 NODE_VER="v24.21.0"; CURL_LOG="${TDIR}/curl.log"
 node() { printf '%s\n' "$NODE_VER"; }

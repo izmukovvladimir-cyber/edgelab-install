@@ -439,7 +439,49 @@ _apt_touches_installed() {
     if ! sim=$(apt_get install -s -y --no-upgrade "$@" 2>/dev/null); then
         return 1
     fi
-    awk '/^Inst [^ ]+ \[/ {print $2} /^Remv / {print $2}' <<<"$sim" | sort -u | tr '\n' ' '
+    # Removals are tagged so the upgrade allowlist below can never excuse them.
+    awk '/^Inst [^ ]+ \[/ {print $2} /^Remv / {print "remove:" $2}' <<<"$sim" | sort -u | tr '\n' ' '
+}
+
+# Installed packages that may be upgraded along the way: pure python
+# libraries, no services behind them (python3-venv pulls them on 24.04).
+readonly APT_UPGRADE_OK=(python3-setuptools python3-pkg-resources python3-setuptools-whl python3-pip-whl python3-wheel)
+
+# _apt_blocking "<touched list>" -- the part of the list NOT in APT_UPGRADE_OK.
+_apt_blocking() {
+    local pkg ok out=()
+    for pkg in $1; do
+        for ok in "${APT_UPGRADE_OK[@]}"; do
+            if [[ "${pkg%%:*}" == "$ok" ]]; then
+                continue 2
+            fi
+        done
+        out+=("$pkg")
+    done
+    printf '%s' "${out[*]:-}"
+}
+
+# _apt_install_checked PKG... -- dry run, then install when it touches only
+# allowlisted packages. Returns 1 (nothing installed) otherwise; the reason
+# is in $APT_LAST_BLOCK.
+APT_LAST_BLOCK=""
+_apt_install_checked() {
+    local touched blocking
+    if ! touched=$(_apt_touches_installed "$@"); then
+        APT_LAST_BLOCK="apt cannot resolve it"
+        return 1
+    fi
+    blocking=$(_apt_blocking "$touched")
+    if [[ -n "$blocking" ]]; then
+        APT_LAST_BLOCK="$blocking"
+        return 1
+    fi
+    log "apt: installing missing $*"
+    # Called in `if` context, where set -e is off: fail loudly by hand.
+    apt_get install -y -qq --no-upgrade "$@" || die "apt-get install $* failed."
+    if [[ -n "${touched// /}" ]]; then
+        log "apt: попутно обновлены: ${touched% }"
+    fi
 }
 
 # apt_install_missing PKG... -- installs only packages that are not installed
@@ -448,8 +490,9 @@ _apt_touches_installed() {
 # --no-upgrade covers only the named packages, so a dry run guards their
 # dependencies: a package that would upgrade/remove anything installed is
 # skipped with a warning and the command to run by hand.
+APT_SKIPPED=()
 apt_install_missing() {
-    local pkg missing=() touched
+    local pkg missing=()
     for pkg in "$@"; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
             continue
@@ -460,21 +503,42 @@ apt_install_missing() {
         return 0
     fi
 
-    if touched=$(_apt_touches_installed "${missing[@]}") && [[ -z "${touched// /}" ]]; then
-        log "apt: installing missing ${missing[*]}"
-        apt_get install -y -qq --no-upgrade "${missing[@]}"
+    if _apt_install_checked "${missing[@]}"; then
         return 0
     fi
     # Together they touch something installed: one by one, each dry-run
     # right before its own install (a set is only as safe as its own run).
     for pkg in "${missing[@]}"; do
-        if touched=$(_apt_touches_installed "$pkg") && [[ -z "${touched// /}" ]]; then
-            log "apt: installing missing ${pkg}"
-            apt_get install -y -qq --no-upgrade "$pkg"
-        else
-            warn "apt: ${pkg} NOT installed -- it would upgrade/remove installed packages: ${touched:-apt cannot resolve it}. If that is fine: sudo apt-get install ${pkg}"
+        if ! _apt_install_checked "$pkg"; then
+            APT_SKIPPED+=("$pkg")
+            warn "apt: ${pkg} NOT installed -- it would upgrade/remove installed packages: ${APT_LAST_BLOCK}. If that is fine: sudo apt-get install ${pkg}"
         fi
     done
+}
+
+# Packages later steps cannot do without (checked by dpkg status, whoever
+# installed them): downloads, clones, JSON, skills rsync, as_edgelab, the
+# tmux unit, bun's unzip, crontab, Richard's venv + the embedded helpers.
+APT_REQUIRED=(ca-certificates curl git jq rsync sudo tmux unzip cron)
+APT_REQUIRED_PY=(python3 python3-venv)
+
+# require_step_packages -- stop BEFORE any agent is installed when a required
+# package is missing, so a failed run leaves no half-installed server and a
+# re-run after the printed apt-get goes straight through.
+require_step_packages() {
+    local pkg missing=()
+    for pkg in "${APT_REQUIRED[@]}" "${APT_REQUIRED_PY[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+            missing+=("$pkg")
+        fi
+    done
+    if ((${#missing[@]} == 0)); then
+        return 0
+    fi
+    err "Stopped before installing the agents: required package(s) missing: ${missing[*]}"
+    err "Nothing of Jarvis/Richard is installed yet. Install them (this may upgrade other packages), then run install.sh again:"
+    err "    sudo apt-get install ${missing[*]}"
+    exit 1
 }
 
 install_apt_deps() {
@@ -502,6 +566,7 @@ install_apt_deps() {
                 add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
                 apt_get update -qq
             fi
+            APT_REQUIRED_PY=(python3.12 python3.12-venv)
             apt_install_missing python3.12 python3.12-venv python3.12-dev python3-pip
             # Point /usr/bin/python3 -> python3.12 so `python3 --version` shows 3.12.
             update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 100 >/dev/null 2>&1 || true
@@ -1818,6 +1883,7 @@ main() {
     banner
     preflight
     install_apt_deps
+    require_step_packages
     install_node
     ensure_edgelab_user
     check_node_for_edgelab
