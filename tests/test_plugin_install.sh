@@ -9,7 +9,17 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TDIR="$(mktemp -d)"
-trap 'rm -rf "${TDIR:?}"' EXIT
+TMUX_SOCKS=()
+cleanup() {
+    local sock
+    for sock in "${TMUX_SOCKS[@]:-}"; do
+        if [[ -n "$sock" ]]; then
+            tmux -L "$sock" kill-server >/dev/null 2>&1 || true
+        fi
+    done
+    rm -rf "${TDIR:?}"
+}
+trap cleanup EXIT
 
 PASS=0
 FAIL=0
@@ -35,6 +45,7 @@ sed -e "s#^readonly EDGELAB_HOME=.*#readonly EDGELAB_HOME=\"${FAKE_HOME}\"#" \
     -e "s#^readonly LEGACY_BACKUP_ROOT=.*#readonly LEGACY_BACKUP_ROOT=\"${TDIR}/backups\"#" \
     -e "s#^readonly RICHARD_HOME=.*#readonly RICHARD_HOME=\"${TDIR}/richard\"#" \
     -e "s#/etc/systemd/system/#${TDIR}/systemd/#g" \
+    -e "s#/usr/local/lib/edgelab/#${TDIR}/libexec/#g" \
     -e 's#\$EUID -ne 0 ]]#$EUID -ne 0 \&\& -z "${TEST_AS_ROOT:-}" ]]#' \
     "${REPO}/install.sh" >"${TDIR}/install.sh"
 
@@ -131,11 +142,87 @@ printf '{not json' >"$CJ3"
 check "trust: broken json -> non-zero" eval '! _accept_trust_dialog "$CJ3" /p/plugin 2>/dev/null'
 check "trust: broken json untouched"   test "$(cat "$CJ3")" = "{not json"
 
+# --- trust: several dirs, rejected channel repaired -------------------------------
+CJ4="${TDIR}/multi.json"
+printf '{"projects":{"/r":{"disabledMcpjsonServers":["dashi-channel","x"],"k":1}}}\n' >"$CJ4"
+_accept_trust_dialog "$CJ4" /r /r/plugin
+check "trust multi: root trusted" \
+    python3 -c "import json,sys; d=json.load(open('$CJ4'))['projects']; sys.exit(0 if d['/r']['hasTrustDialogAccepted'] and d['/r/plugin']['hasTrustDialogAccepted'] else 1)"
+check "trust multi: channel un-disabled, rest kept" \
+    python3 -c "import json,sys; e=json.load(open('$CJ4'))['projects']['/r']; sys.exit(0 if e['disabledMcpjsonServers']==['x'] and e['k']==1 else 1)"
+
+# --- MCP pre-approval (settings.local.json) -------------------------------------
+SL1="${TDIR}/repo/.claude/settings.local.json"; SL2="${TDIR}/repo/plugin/.claude/settings.local.json"
+_approve_channel_mcp "$SL1" "$SL2"
+check "mcp: root file created"   python3 -c "import json,sys; sys.exit(0 if json.load(open('$SL1'))['enabledMcpjsonServers']==['dashi-channel'] else 1)"
+check "mcp: plugin file created" python3 -c "import json,sys; sys.exit(0 if json.load(open('$SL2'))['enabledMcpjsonServers']==['dashi-channel'] else 1)"
+check "mcp: new file is 0600"  test "$(stat -c %a "$SL2")" = "600"
+printf '{"disabledMcpjsonServers":["dashi-channel","other"],"enabledMcpjsonServers":["gbrain"],"permissions":{"allow":["x"]}}\n' >"$SL1"
+chmod 640 "$SL1"
+_approve_channel_mcp "$SL1"
+_approve_channel_mcp "$SL1"
+check "mcp: rejected channel repaired" \
+    python3 -c "import json,sys; d=json.load(open('$SL1')); sys.exit(0 if d['disabledMcpjsonServers']==['other'] and d['enabledMcpjsonServers']==['gbrain','dashi-channel'] else 1)"
+check "mcp: existing mode kept" test "$(stat -c %a "$SL1")" = "640"
+check "mcp: other keys kept" \
+    python3 -c "import json,sys; d=json.load(open('$SL1')); sys.exit(0 if d['permissions']=={'allow':['x']} else 1)"
+printf '{broken' >"$SL2"
+check "mcp: broken json -> non-zero" eval '! _approve_channel_mcp "$SL2" 2>/dev/null'
+check "mcp: broken json untouched"   test "$(cat "$SL2")" = "{broken"
+
+# --- channel-start.sh: bot id from the token ------------------------------------
+FAKEBIN="${TDIR}/fakebin"; mkdir -p "$FAKEBIN"
+cat >"${FAKEBIN}/tmux" <<'EOF'
+#!/usr/bin/env bash
+[[ " $* " == *" kill-server "* ]] && { printf 'KILL=%s\n' "$*" >>"${FAKE_TMUX_LOG:?}"; exit 1; }
+printf 'ARGS=%s\n' "$*"
+printf 'ENV=%s\n' "${TELEGRAM_EXPECTED_BOT_ID-<unset>}"
+EOF
+chmod +x "${FAKEBIN}/tmux"
+CS="${REPO}/templates/channel-start.sh"
+export FAKE_TMUX_LOG="${TDIR}/fake-tmux.log"; : >"$FAKE_TMUX_LOG"
+O1=$(PATH="${FAKEBIN}:$PATH" TELEGRAM_BOT_TOKEN="$TOKEN" TELEGRAM_EXPECTED_BOT_ID=8507713167 bash "$CS" channel-jarvis claude --x)
+check "start: id from token, stale one replaced" grep -qx 'ENV=123456789' <<<"$O1"
+check "start: leftover server killed first"     grep -qx 'KILL=-L channel-jarvis kill-server' "$FAKE_TMUX_LOG"
+check "start: session args"                      grep -qx 'ARGS=-L channel-jarvis new-session -d -s channel-jarvis claude --x' <<<"$O1"
+check "start: token not in argv"                 bash -c "! grep -q 'AAHabc' <<<\"\$1\"" _ "$O1"
+O2=$(PATH="${FAKEBIN}:$PATH" TELEGRAM_BOT_TOKEN="" TELEGRAM_EXPECTED_BOT_ID="" bash "$CS" channel-jarvis claude)
+check "start: no token -> id unset (not empty)"  grep -qx 'ENV=<unset>' <<<"$O2"
+check "start: no token -> session args"          grep -qx 'ARGS=-L channel-jarvis new-session -d -s channel-jarvis claude' <<<"$O2"
+if command -v tmux >/dev/null 2>&1; then
+    SOCK="edgelab-test-$$"; TMUX_SOCKS+=("$SOCK"); ENVOUT="${TDIR}/tmux-env"; : >"$ENVOUT"
+    TELEGRAM_BOT_TOKEN="$TOKEN2" TELEGRAM_EXPECTED_BOT_ID=8507713167 \
+        bash "$CS" "$SOCK" sh -c "env >'$ENVOUT'; sleep 30" >/dev/null 2>&1
+    for _ in 1 2 3 4 5; do [[ -s "$ENVOUT" ]] && break; sleep 1; done
+    tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true
+    check "start (real tmux): id reaches the session" grep -qx 'TELEGRAM_EXPECTED_BOT_ID=987654321' "$ENVOUT"
+
+    # A leftover server started with bot A must not leak A into bot B's session.
+    SOCK2="edgelab-test2-$$"; TMUX_SOCKS+=("$SOCK2"); ENVOUT2="${TDIR}/tmux-env2"; : >"$ENVOUT2"
+    TELEGRAM_BOT_TOKEN="$TOKEN" TELEGRAM_EXPECTED_BOT_ID=123456789 \
+        tmux -L "$SOCK2" new-session -d -s "$SOCK2" sleep 60
+    TELEGRAM_BOT_TOKEN="$TOKEN2" bash "$CS" "$SOCK2" sh -c "env >'$ENVOUT2'; sleep 30" >/dev/null 2>&1
+    for _ in 1 2 3 4 5; do [[ -s "$ENVOUT2" ]] && break; sleep 1; done
+    check "start (leftover server): new id"    grep -qx 'TELEGRAM_EXPECTED_BOT_ID=987654321' "$ENVOUT2"
+    check "start (leftover server): new token" grep -qx "TELEGRAM_BOT_TOKEN=${TOKEN2}" "$ENVOUT2"
+    tmux -L "$SOCK2" kill-server >/dev/null 2>&1 || true
+
+    # Leftover server with an id, then no token: the id must not survive.
+    SOCK3="edgelab-test3-$$"; TMUX_SOCKS+=("$SOCK3"); ENVOUT3="${TDIR}/tmux-env3"; : >"$ENVOUT3"
+    TELEGRAM_EXPECTED_BOT_ID=123456789 tmux -L "$SOCK3" new-session -d -s "$SOCK3" sleep 60
+    env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_EXPECTED_BOT_ID bash "$CS" "$SOCK3" sh -c "env >'$ENVOUT3'; echo end >>'$ENVOUT3'; sleep 30" >/dev/null 2>&1
+    for _ in 1 2 3 4 5; do grep -q '^end$' "$ENVOUT3" && break; sleep 1; done
+    check "start (leftover server, no token): no id" bash -c "grep -q '^end$' '$ENVOUT3' && ! grep -q '^TELEGRAM_EXPECTED_BOT_ID=' '$ENVOUT3'"
+    tmux -L "$SOCK3" kill-server >/dev/null 2>&1 || true
+fi
+
 # --- unit template --------------------------------------------------------------
 UNIT="${TDIR}/unit"
 render_template "${REPO}/templates/channel-jarvis.service" "$UNIT" \
     USER edgelab HOME /home/edgelab PLUGIN_DIR /pd ENV_FILE /etc/dashi-plugin/jarvis/channel.env \
-    CONFIRM_SCRIPT /usr/local/lib/edgelab/channel-confirm.sh
+    CONFIRM_SCRIPT /usr/local/lib/edgelab/channel-confirm.sh \
+    START_SCRIPT /usr/local/lib/edgelab/channel-start.sh
+check "unit: start via channel-start.sh" grep -q '^ExecStart=/bin/bash /usr/local/lib/edgelab/channel-start.sh channel-jarvis claude ' "$UNIT"
 check "unit: no placeholders left"   hasnt "$UNIT" '\{\{'
 check "unit: user"                   has "$UNIT" "User=edgelab"
 check "unit: workdir"                has "$UNIT" "WorkingDirectory=/pd"
@@ -310,6 +397,32 @@ check "rollback: no gateway -> nothing enabled" bash -c "! grep -q '^enable' '$C
 check "rollback: no gateway -> plugin left running" bash -c "! grep -q 'disable' '$CALLS'"
 unset -f systemctl install
 unset TEST_AS_ROOT
+
+# --- install_jarvis end to end (git/bun stubbed): approval + trust land -------
+PR="${FAKE_HOME}/.claude-lab/jarvis/.claude/dashi-plugin-claude-code"
+mkdir -p "${PR}/.git" "${PR}/plugin" "${PR}/.claude"; printf '{}' >"${PR}/plugin/.mcp.json"
+# What a rejected first start leaves behind (seen live, Claude Code 2.1.283).
+printf '{"disabledMcpjsonServers":["dashi-channel"]}\n' >"${PR}/.claude/settings.local.json"
+as_edgelab() { case "$1" in git|env) return 0 ;; *) "$@" ;; esac; }
+install() {
+    local args=()
+    while (($#)); do case $1 in -o|-g|-m) shift 2 ;; *) args+=("$1"); shift ;; esac; done
+    command install "${args[@]}"
+}
+fix_owner() { :; }
+mkdir -p "${TDIR}/libexec"
+JARVIS_BOT_TOKEN="$TOKEN"; TG_USER_ID="555"
+install_jarvis >/dev/null 2>&1
+check "jarvis: root settings approve channel" \
+    python3 -c "import json,sys; d=json.load(open('${PR}/.claude/settings.local.json')); sys.exit(0 if 'dashi-channel' in d['enabledMcpjsonServers'] and 'dashi-channel' not in d.get('disabledMcpjsonServers',[]) else 1)"
+check "jarvis: plugin settings approve channel" \
+    python3 -c "import json,sys; d=json.load(open('${PR}/plugin/.claude/settings.local.json')); sys.exit(0 if 'dashi-channel' in d['enabledMcpjsonServers'] else 1)"
+check "jarvis: repo root + plugin trusted" \
+    python3 -c "import json,sys; p=json.load(open('${FAKE_HOME}/.claude.json'))['projects']; sys.exit(0 if p['${PR}']['hasTrustDialogAccepted'] and p['${PR}/plugin']['hasTrustDialogAccepted'] else 1)"
+check "jarvis: start script installed"  test -x "${TDIR}/libexec/channel-start.sh"
+check "jarvis: unit uses start script"  grep -q "^ExecStart=/bin/bash ${TDIR}/libexec/channel-start.sh channel-jarvis " "${TDIR}/systemd/channel-jarvis.service"
+unset -f install fix_owner
+as_edgelab() { "$@"; }
 
 # --- workspace: a re-run keeps the agent's files --------------------------------
 WS="${TDIR}/ws"

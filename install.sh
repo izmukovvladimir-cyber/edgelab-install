@@ -39,6 +39,7 @@ readonly PLUGIN_REF="main"
 readonly JARVIS_UNIT="channel-jarvis"
 readonly JARVIS_ENV_DIR="/etc/dashi-plugin/jarvis"
 readonly CHANNEL_CONFIRM_BIN="/usr/local/lib/edgelab/channel-confirm.sh"
+readonly CHANNEL_START_BIN="/usr/local/lib/edgelab/channel-start.sh"
 # Pre-plugin Jarvis (v3.0.x). Kept on disk for --rollback, never deleted.
 readonly LEGACY_GATEWAY_UNIT="claude-gateway"
 readonly LEGACY_GATEWAY_DIR_NAME="claude-gateway"
@@ -883,13 +884,21 @@ install_jarvis() {
     _write_channel_env "$env_file" "$state_dir" "$wsroot"
 
     # Without it the folder-trust prompt sits on "No, exit", the Enter from
-    # channel-confirm closes claude and the unit restarts in a loop.
-    if ! _accept_trust_dialog "${EDGELAB_HOME}/.claude.json" "$plugin_dir"; then
-        warn "Could not mark ${plugin_dir} as trusted in ${EDGELAB_HOME}/.claude.json -- Jarvis may stop on the trust prompt."
+    # channel-confirm closes claude and the unit restarts in a loop. Both the
+    # repo root (claude 2.1.x takes the git root as the project) and plugin/.
+    if ! _accept_trust_dialog "${EDGELAB_HOME}/.claude.json" "$plugin_root" "$plugin_dir"; then
+        warn "Could not mark ${plugin_root} as trusted in ${EDGELAB_HOME}/.claude.json -- Jarvis may stop on the trust prompt."
+    fi
+    # Pre-approve the channel MCP server from plugin/.mcp.json: otherwise the
+    # first start shows the approval dialog, the Enter from channel-confirm
+    # rejects it and claude writes disabledMcpjsonServers:["dashi-channel"].
+    if ! _approve_channel_mcp "${plugin_root}/.claude/settings.local.json" "${plugin_dir}/.claude/settings.local.json"; then
+        warn "Could not pre-approve dashi-channel in ${plugin_root}/.claude/settings.local.json -- Jarvis may start without the channel."
     fi
 
     install -d -m 0755 -o root -g root "$(dirname "$CHANNEL_CONFIRM_BIN")"
     install -m 0755 -o root -g root "${TEMPLATES_DIR}/channel-confirm.sh" "$CHANNEL_CONFIRM_BIN"
+    install -m 0755 -o root -g root "${TEMPLATES_DIR}/channel-start.sh" "$CHANNEL_START_BIN"
 
     local unit_tmp
     unit_tmp=$(mktemp)
@@ -899,7 +908,8 @@ install_jarvis() {
         HOME           "$EDGELAB_HOME" \
         PLUGIN_DIR     "$plugin_dir" \
         ENV_FILE       "$env_file" \
-        CONFIRM_SCRIPT "$CHANNEL_CONFIRM_BIN"
+        CONFIRM_SCRIPT "$CHANNEL_CONFIRM_BIN" \
+        START_SCRIPT   "$CHANNEL_START_BIN"
     install -m 0644 -o root -g root "$unit_tmp" "/etc/systemd/system/${JARVIS_UNIT}.service"
 
     fix_owner "${EDGELAB_HOME}/.claude-lab"
@@ -1044,11 +1054,11 @@ out = [
     "#   sudo systemctl enable channel-jarvis && sudo systemctl restart channel-jarvis",
     "# TELEGRAM_ALLOWED_CHAT_IDS must contain your id too: without it every private",
     "# message is dropped silently. Voice needs GROQ_API_KEY=<key> (optional).",
-    "# Do not add an empty TELEGRAM_EXPECTED_BOT_ID= line: the plugin refuses to start.",
+    "# TELEGRAM_EXPECTED_BOT_ID is set at every start from the token (channel-start.sh).",
 ]
 out += [f"{k}={v}" for k, v in managed.items()]
-# The expected bot id is only the token prefix -- a stale copy after a bot
-# change would stop the plugin, so it is not carried over.
+# The expected bot id is only the token prefix; channel-start.sh derives it
+# at every start, a stale copy after a bot change would stop the plugin.
 extras = {k: v for k, v in existing.items() if k not in managed and k != "TELEGRAM_EXPECTED_BOT_ID"}
 if extras:
     out.append("# --- kept from the previous file ---")
@@ -1121,10 +1131,11 @@ print("\n".join(out))
 PY
 }
 
-# _accept_trust_dialog <claude_json> <project_dir> -- sets
-# projects[<dir>].hasTrustDialogAccepted=true, keeps every other key.
+# _accept_trust_dialog <claude_json> <project_dir>... -- sets
+# projects[<dir>].hasTrustDialogAccepted=true for each dir and takes
+# dashi-channel off its disabledMcpjsonServers; keeps every other key.
 _accept_trust_dialog() {
-    as_edgelab python3 - "$1" "$2" <<'PY'
+    as_edgelab python3 - "$@" <<'PY'
 import json
 import os
 import shutil
@@ -1132,7 +1143,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-path, project = Path(sys.argv[1]), sys.argv[2]
+path, projects_to_trust = Path(sys.argv[1]), sys.argv[2:]
 data: dict = {}
 mode = 0o600
 if path.exists():
@@ -1150,10 +1161,14 @@ if path.exists():
 projects = data.setdefault("projects", {})
 if not isinstance(projects, dict):
     sys.exit(f"{path}: 'projects' is not an object; left untouched")
-entry = projects.setdefault(project, {})
-if not isinstance(entry, dict):
-    sys.exit(f"{path}: projects[{project}] is not an object; left untouched")
-entry["hasTrustDialogAccepted"] = True
+for project in projects_to_trust:
+    entry = projects.setdefault(project, {})
+    if not isinstance(entry, dict):
+        sys.exit(f"{path}: projects[{project}] is not an object; left untouched")
+    entry["hasTrustDialogAccepted"] = True
+    disabled = entry.get("disabledMcpjsonServers")
+    if isinstance(disabled, list) and "dashi-channel" in disabled:
+        entry["disabledMcpjsonServers"] = [s for s in disabled if s != "dashi-channel"]
 # First TUI start otherwise stops on the theme picker, which nobody answers.
 data.setdefault("hasCompletedOnboarding", True)
 
@@ -1163,6 +1178,49 @@ with os.fdopen(fd, "w") as fh:
     fh.write("\n")
 os.chmod(tmp, mode)
 os.replace(tmp, path)
+PY
+}
+
+# _approve_channel_mcp <settings.local.json>... -- in each file: dashi-channel
+# into enabledMcpjsonServers, out of disabledMcpjsonServers (repairs a first
+# start that rejected it); every other key kept. Mirrors the live agents.
+_approve_channel_mcp() {
+    as_edgelab python3 - "$@" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+SERVER = "dashi-channel"
+for arg in sys.argv[1:]:
+    path = Path(arg)
+    data: dict = {}
+    mode = 0o600    # new file: private; an existing one keeps its own mode
+    if path.exists():
+        mode = path.stat().st_mode & 0o777
+        try:
+            data = json.loads(path.read_text() or "{}")
+        except json.JSONDecodeError as exc:
+            sys.exit(f"{path}: not valid JSON ({exc}); left untouched")
+        if not isinstance(data, dict):
+            sys.exit(f"{path}: top level is not an object; left untouched")
+    enabled = data.get("enabledMcpjsonServers", [])
+    disabled = data.get("disabledMcpjsonServers", [])
+    if not isinstance(enabled, list) or not isinstance(disabled, list):
+        sys.exit(f"{path}: MCP server lists are not arrays; left untouched")
+    if SERVER not in enabled:
+        enabled.append(SERVER)
+    data["enabledMcpjsonServers"] = enabled
+    if SERVER in disabled:
+        data["disabledMcpjsonServers"] = [s for s in disabled if s != SERVER]
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".settings.local.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
 PY
 }
 
