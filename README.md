@@ -15,9 +15,9 @@ curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-insta
 | Компонент | Версия | Назначение |
 |---|---|---|
 | Node.js | 22.x | Среда для Claude Code CLI |
-| Python | 3.12+ | Gateway и скрипты |
+| Python | 3.12+ | Скрипты |
 | Claude Code | latest | AI-агент (Anthropic, Opus -- код/ревью, Sonnet -- субагенты) |
-| Telegram Gateway | latest | Связь агента с Telegram |
+| Bun + [dashi-plugin](https://github.com/izmukovvladimir-cyber/dashi-plugin-claude-code) | latest (main) | Связь агента с Telegram |
 | Caddy | latest | Веб-сервер для вебхуков |
 | UFW + fail2ban | -- | Безопасность сервера |
 
@@ -26,29 +26,30 @@ curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-insta
 ## Архитектура
 
 ```
-Telegram --> Bot API --> Gateway (Python) --> Claude Code --> ответ
+Telegram --> Bot API --> dashi-plugin (MCP-канал) --> Claude Code --> ответ
                                   |
-                           config.json
+                           channel.env
                            (bot token,
                             user ID,
                             workspace)
 ```
 
-Gateway работает как systemd-сервис, получает сообщения из Telegram через long polling, передаёт их в Claude Code и отправляет ответ обратно.
+Плагин работает как systemd-сервис `channel-jarvis`: Claude Code запущен в tmux, плагин получает сообщения из Telegram и передаёт их в ту же сессию, ответ уходит обратно в Telegram.
 
 ## После установки
 
 1. **Авторизуйте Claude Code** -- запустите `claude` в терминале, пройдите OAuth-авторизацию (Anthropic Max подписка, $100-200/мес)
 
-2. **Настройте бота** -- откройте `~/claude-gateway/config.json`:
+2. **Настройте бота** -- откройте `/etc/dashi-plugin/jarvis/channel.env` (от root):
    - Создайте бота через [@BotFather](https://t.me/BotFather) в Telegram
-   - Сохраните токен: `echo "YOUR_TOKEN" > ~/claude-gateway/secrets/bot-token && chmod 600 ~/claude-gateway/secrets/bot-token`
-   - Укажите свой Telegram user ID в `allowlist_user_ids`
+   - `TELEGRAM_BOT_TOKEN=<токен бота>`
+   - Свой Telegram user ID (из [@userinfobot](https://t.me/userinfobot)) впишите в ОБЕ строки:
+     `TELEGRAM_ALLOWED_USER_IDS=<id>` и `TELEGRAM_ALLOWED_CHAT_IDS=<id>` (без второй бот молча не видит личку)
 
-3. **Запустите gateway**:
+3. **Запустите агента**:
    ```bash
-   sudo systemctl start claude-gateway
-   sudo systemctl enable claude-gateway
+   sudo systemctl enable channel-jarvis
+   sudo systemctl restart channel-jarvis
    ```
 
 4. **Напишите боту** -- агент ответит
@@ -108,12 +109,10 @@ Gateway работает как systemd-сервис, получает сооб�
   scripts/                     # cron ротации памяти
   logs/
 
-~/claude-gateway/              # Telegram Gateway
-  gateway.py                   # основной скрипт
-  config.json                  # workspace -> ~/.claude-lab/{agent}/.claude
-  secrets/                     # chmod 700
-    bot-token                  # Telegram bot token
-    groq-api-key               # (опционально)
+~/.claude-lab/jarvis/.claude/dashi-plugin-claude-code/   # Telegram-канал (плагин)
+  plugin/                      # рабочий каталог сессии Claude Code
+/etc/dashi-plugin/jarvis/channel.env   # токен бота, ваш ID, ключ Groq
+/etc/systemd/system/channel-jarvis.service
 ```
 
 Для продвинутой архитектуры с памятью, скиллами и автоматизацией смотрите: [public-architecture-claude-code](https://github.com/izmukovvladimir-cyber/public-architecture-claude-code)
@@ -159,14 +158,20 @@ EOF
 ## Полезные команды
 
 ```bash
-# Статус gateway
-sudo systemctl status claude-gateway
+# Статус агента
+sudo systemctl status channel-jarvis
 
-# Логи gateway
-sudo journalctl -u claude-gateway -f
+# Логи агента
+sudo journalctl -u channel-jarvis -f
 
-# Перезапуск после изменения config.json
-sudo systemctl restart claude-gateway
+# Экран сессии Claude Code
+sudo -u edgelab tmux -L channel-jarvis capture-pane -p -t channel-jarvis | tail -30
+
+# Перезапуск после изменения channel.env
+sudo systemctl restart channel-jarvis
+
+# Вернуть старый claude-gateway (если сервер ставился раньше, на шлюзе)
+sudo bash install.sh --rollback
 
 # Обновить Claude Code
 claude update
