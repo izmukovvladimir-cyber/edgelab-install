@@ -4,7 +4,8 @@
 # Installs on a fresh Ubuntu 22.04 / 24.04 VPS:
 #   - edgelab user (dedicated, non-login-privileged)
 #   - Node.js 22 + Python 3.12 + Claude Code CLI
-#   - Jarvis: izmukovvladimir-cyber/jarvis-telegram-gateway -> systemd unit claude-gateway
+#   - Jarvis: izmukovvladimir-cyber/dashi-plugin-claude-code (main) -> systemd unit channel-jarvis
+#     (a server that still runs the old claude-gateway is migrated; see --rollback)
 #   - Richard: izmukovvladimir-cyber/claude-code-telegram v1.6.0 -> systemd unit claude-richard
 #
 # Both agents share Anthropic Max OAuth from /home/edgelab/.claude/
@@ -14,6 +15,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-install/main/install.sh -o install.sh && sudo bash install.sh
 #   # or
 #   sudo ./install.sh
+#   sudo ./install.sh --rollback   # Jarvis back to the old claude-gateway unit
 #
 # Env overrides (non-interactive):
 #   EDGELAB_JARVIS_BOT_TOKEN   Jarvis Telegram bot token
@@ -31,9 +33,16 @@ set -euo pipefail
 # CONSTANTS
 # =============================================================================
 
-readonly EDGELAB_VERSION="3.0.3"
-readonly JARVIS_REPO="https://github.com/izmukovvladimir-cyber/jarvis-telegram-gateway.git"
-readonly JARVIS_DIR_NAME="claude-gateway"
+readonly EDGELAB_VERSION="3.1.0"
+readonly PLUGIN_REPO="https://github.com/izmukovvladimir-cyber/dashi-plugin-claude-code.git"
+readonly PLUGIN_REF="main"
+readonly JARVIS_UNIT="channel-jarvis"
+readonly JARVIS_ENV_DIR="/etc/dashi-plugin/jarvis"
+readonly CHANNEL_CONFIRM_BIN="/usr/local/lib/edgelab/channel-confirm.sh"
+# Pre-plugin Jarvis (v3.0.x). Kept on disk for --rollback, never deleted.
+readonly LEGACY_GATEWAY_UNIT="claude-gateway"
+readonly LEGACY_GATEWAY_DIR_NAME="claude-gateway"
+readonly LEGACY_BACKUP_ROOT="/var/backups/edgelab-install"
 readonly RICHARD_REPO_SPEC="git+https://github.com/izmukovvladimir-cyber/claude-code-telegram@v1.6.0"
 readonly RICHARD_HOME="/opt/richard"
 readonly NODE_MAJOR="22"
@@ -431,7 +440,8 @@ install_apt_deps() {
         build-essential \
         systemd \
         logrotate \
-        cron
+        cron \
+        unzip tmux
 
     # Python 3.12: native on Ubuntu 24.04. On 22.04 we need deadsnakes PPA
     # because the default python3 is 3.10 and Day 1 promises "Python 3.12+".
@@ -550,6 +560,40 @@ _ensure_path_export() {
         fi
         install -o "$EDGELAB_USER" -g "$EDGELAB_USER" -m 0644 "$tmp" "$rc"
     done
+}
+
+# =============================================================================
+# STEP 3b: BUN (runtime of the dashi-plugin channel)
+# =============================================================================
+
+install_bun() {
+    step 3b "Installing Bun (per-user for ${EDGELAB_USER})"
+
+    local bun_bin="${EDGELAB_HOME}/.bun/bin/bun"
+    if [[ -x "$bun_bin" ]]; then
+        ok "Bun $(as_edgelab "$bun_bin" --version 2>/dev/null || echo '?') already installed."
+        return 0
+    fi
+
+    # bun.sh/install unpacks a zip; fresh Ubuntu ships without unzip.
+    if ! command -v unzip &>/dev/null; then
+        apt_get install -y -qq unzip
+    fi
+
+    local installer_tmp
+    installer_tmp=$(mktemp)
+    TMPFILES+=("$installer_tmp")
+    curl "${CURL_OPTS[@]}" https://bun.sh/install -o "$installer_tmp" \
+        || die "Failed to download Bun installer."
+    chmod 644 "$installer_tmp"
+
+    # As edgelab, so the binary lands at ~/.bun/bin/bun (the unit PATH has it).
+    as_edgelab bash "$installer_tmp" >/dev/null
+
+    if [[ ! -x "$bun_bin" ]]; then
+        die "Bun install failed -- ${bun_bin} not found."
+    fi
+    ok "Bun $(as_edgelab "$bun_bin" --version 2>/dev/null || echo '?') installed at ${bun_bin}."
 }
 
 # =============================================================================
@@ -672,68 +716,272 @@ BRIEF
 # =============================================================================
 
 install_jarvis() {
-    step 6 "Installing Jarvis (claude-gateway)"
+    step 6 "Installing Jarvis (dashi-plugin, systemd: ${JARVIS_UNIT})"
 
-    local dir="${EDGELAB_HOME}/${JARVIS_DIR_NAME}"
-
-    if [[ -d "${dir}/.git" ]]; then
-        log "Jarvis repo exists -- pulling latest."
-        as_edgelab git -C "$dir" pull --ff-only || warn "git pull failed; continuing with existing checkout."
-    else
-        as_edgelab git clone --depth 1 "$JARVIS_REPO" "$dir"
-    fi
-
-    # Virtualenv + requirements
-    local venv="${dir}/.venv"
-    if [[ ! -x "${venv}/bin/python" ]]; then
-        as_edgelab python3 -m venv "$venv"
-    fi
-    if [[ -f "${dir}/requirements.txt" ]]; then
-        as_edgelab "${venv}/bin/pip" install --upgrade pip --quiet
-        as_edgelab "${venv}/bin/pip" install -r "${dir}/requirements.txt" --quiet
-    fi
-
-    # gateway config.json. Holds bot_token and allowed_user_ids inline (Day 1
-    # workshop format). chmod 0600 because it contains a secret.
     local wsroot="${EDGELAB_HOME}/.claude-lab/jarvis/.claude"
+    local plugin_root="${wsroot}/dashi-plugin-claude-code"
+    local plugin_dir="${plugin_root}/plugin"
+    local state_dir="${EDGELAB_HOME}/.claude-lab/shared/state/jarvis/telegram"
+    local env_file="${JARVIS_ENV_DIR}/channel.env"
+
     install -d -m 0755 -o "$EDGELAB_USER" -g "$EDGELAB_USER" \
         "${EDGELAB_HOME}/.claude-lab" \
         "${EDGELAB_HOME}/.claude-lab/jarvis" \
-        "$wsroot"
-
-    local config_tmp
-    config_tmp=$(mktemp)
-    TMPFILES+=("$config_tmp")
-    render_template "${TEMPLATES_DIR}/gateway-config.json" "$config_tmp" \
-        USER        "$EDGELAB_USER" \
-        AGENT_NAME  "jarvis" \
-        USER_NAME   "$OPERATOR_NAME"
-    # Inject bot_token and allowed_user_ids via jq. Values may be empty if the
-    # student skipped the prompt -- agent fills them in via Day 1 Block 5.
-    local patched
-    patched=$(mktemp)
-    TMPFILES+=("$patched")
-    local id_arg="null"
-    [[ -n "$TG_USER_ID" ]] && id_arg="[${TG_USER_ID}]"
-    jq --arg tok "$JARVIS_BOT_TOKEN" --argjson ids "${id_arg}" \
-       '.agents.jarvis.bot_token = $tok | .allowed_user_ids = ($ids // [])' \
-       "$config_tmp" > "$patched"
-    mv "$patched" "$config_tmp"
-    install_as_user "$config_tmp" "${dir}/config.json" "$EDGELAB_USER" 0600
+        "$wsroot" \
+        "${EDGELAB_HOME}/.claude-lab/shared" \
+        "${EDGELAB_HOME}/.claude-lab/shared/state"
+    install -d -m 0700 -o "$EDGELAB_USER" -g "$EDGELAB_USER" \
+        "${EDGELAB_HOME}/.claude-lab/shared/state/jarvis" \
+        "$state_dir"
 
     # Full agent workspace (CLAUDE.md + core/USER.md + stub cold memory).
+    # Existing files are kept, so a re-run never wipes the agent's memory.
     _write_agent_workspace "$wsroot"
 
-    # systemd unit
+    # The plugin lives inside the workspace: claude runs in plugin/ and picks
+    # up the agent CLAUDE.md from the parent dirs.
+    if [[ -d "${plugin_root}/.git" ]]; then
+        log "Plugin repo exists -- pulling latest ${PLUGIN_REF}."
+        as_edgelab git -C "$plugin_root" pull --ff-only || warn "git pull failed; continuing with existing checkout."
+    else
+        as_edgelab git clone --depth 1 --branch "$PLUGIN_REF" "$PLUGIN_REPO" "$plugin_root"
+    fi
+    [[ -f "${plugin_dir}/.mcp.json" ]] || die "Plugin checkout has no plugin/.mcp.json (${plugin_root})."
+    as_edgelab env -C "$plugin_dir" "${EDGELAB_HOME}/.bun/bin/bun" install \
+        || die "bun install failed in ${plugin_dir}."
+
+    # Server that still runs the old gateway: reuse its token / allowlist.
+    _collect_jarvis_channel_inputs "$env_file"
+
+    _write_channel_env "$env_file" "$state_dir" "$wsroot"
+
+    # Without it the folder-trust prompt sits on "No, exit", the Enter from
+    # channel-confirm closes claude and the unit restarts in a loop.
+    if ! _accept_trust_dialog "${EDGELAB_HOME}/.claude.json" "$plugin_dir"; then
+        warn "Could not mark ${plugin_dir} as trusted in ${EDGELAB_HOME}/.claude.json -- Jarvis may stop on the trust prompt."
+    fi
+
+    install -d -m 0755 -o root -g root "$(dirname "$CHANNEL_CONFIRM_BIN")"
+    install -m 0755 -o root -g root "${TEMPLATES_DIR}/channel-confirm.sh" "$CHANNEL_CONFIRM_BIN"
+
     local unit_tmp
     unit_tmp=$(mktemp)
     TMPFILES+=("$unit_tmp")
-    render_template "${TEMPLATES_DIR}/claude-gateway.service" "$unit_tmp" \
-        USER "$EDGELAB_USER"
-    install -m 0644 -o root -g root "$unit_tmp" /etc/systemd/system/claude-gateway.service
+    render_template "${TEMPLATES_DIR}/${JARVIS_UNIT}.service" "$unit_tmp" \
+        USER           "$EDGELAB_USER" \
+        HOME           "$EDGELAB_HOME" \
+        PLUGIN_DIR     "$plugin_dir" \
+        ENV_FILE       "$env_file" \
+        CONFIRM_SCRIPT "$CHANNEL_CONFIRM_BIN"
+    install -m 0644 -o root -g root "$unit_tmp" "/etc/systemd/system/${JARVIS_UNIT}.service"
 
     fix_owner "${EDGELAB_HOME}/.claude-lab"
-    ok "Jarvis installed at ${dir}"
+    ok "Jarvis installed: plugin ${plugin_dir}, env ${env_file}, unit ${JARVIS_UNIT}"
+}
+
+# Jarvis channel inputs, per field: operator answer -> current channel.env
+# (render_channel_env keeps its values) -> old gateway config (first migration
+# only, so a token rotated in channel.env is never replaced by the stale one).
+JARVIS_ALLOWED_IDS=""
+JARVIS_GROQ_KEY_FILE=""
+
+# _env_has_value <env_file> <KEY> -- true when KEY=<non-empty> is in the file.
+_env_has_value() {
+    [[ -f "$1" ]] && grep -qE "^[[:space:]]*${2}=[^[:space:]]" "$1"
+}
+
+_collect_jarvis_channel_inputs() {
+    local env_file=${1:-}
+    local legacy_dir="${EDGELAB_HOME}/${LEGACY_GATEWAY_DIR_NAME}"
+    local legacy_cfg="${legacy_dir}/config.json"
+    local shared_groq="${EDGELAB_HOME}/.claude-lab/shared/secrets/groq-api-key"
+    local legacy_groq="${legacy_dir}/secrets/groq-api-key"
+
+    JARVIS_ALLOWED_IDS="$TG_USER_ID"
+    JARVIS_GROQ_KEY_FILE=""
+    if _env_has_value "$env_file" GROQ_API_KEY; then
+        :   # key already in channel.env (maybe rotated there) -- keep it
+    elif [[ -s "$shared_groq" ]]; then
+        JARVIS_GROQ_KEY_FILE="$shared_groq"
+    elif [[ -s "$legacy_groq" ]]; then
+        JARVIS_GROQ_KEY_FILE="$legacy_groq"
+    fi
+
+    if [[ ! -f "$legacy_cfg" ]]; then
+        return 0
+    fi
+    if [[ -z "$JARVIS_BOT_TOKEN" ]] && ! _env_has_value "$env_file" TELEGRAM_BOT_TOKEN; then
+        local legacy_token
+        legacy_token=$(jq -r '.agents.jarvis.bot_token // ""' "$legacy_cfg" 2>/dev/null || true)
+        if [[ -z "$legacy_token" && -s "${legacy_dir}/secrets/bot-token" ]]; then
+            legacy_token=$(tr -d '[:space:]' < "${legacy_dir}/secrets/bot-token")
+        fi
+        if [[ -n "$legacy_token" ]]; then
+            if validate_tg_token "$legacy_token"; then
+                JARVIS_BOT_TOKEN="$legacy_token"
+                log "Jarvis bot token taken from the old gateway (${legacy_dir})."
+            else
+                warn "Old gateway token has an unexpected format -- not reused."
+            fi
+        fi
+    fi
+    if [[ -z "$JARVIS_ALLOWED_IDS" ]] && ! _env_has_value "$env_file" TELEGRAM_ALLOWED_USER_IDS; then
+        JARVIS_ALLOWED_IDS=$(jq -r '[(.allowed_user_ids // .allowlist_user_ids // [])[] | tostring] | join(",")' \
+            "$legacy_cfg" 2>/dev/null || true)
+    fi
+    return 0
+}
+
+# _write_channel_env <env_file> <state_dir> <workspace_root>
+# root:edgelab 0640 -- systemd reads it for the unit, the agent may read it.
+_write_channel_env() {
+    local env_file=$1 state_dir=$2 ws_root=$3
+    local tmp
+    tmp=$(mktemp)
+    TMPFILES+=("$tmp")
+
+    CHANNEL_ENV_TOKEN="$JARVIS_BOT_TOKEN" render_channel_env \
+        "$env_file" "$JARVIS_ALLOWED_IDS" "$JARVIS_GROQ_KEY_FILE" "$state_dir" "$ws_root" >"$tmp" \
+        || die "Could not build ${env_file}."
+
+    install -d -m 0755 -o root -g root "$(dirname "$JARVIS_ENV_DIR")"
+    install -d -m 0750 -o root -g "$EDGELAB_USER" "$JARVIS_ENV_DIR"
+    install -m 0640 -o root -g "$EDGELAB_USER" "$tmp" "$env_file"
+}
+
+# render_channel_env <existing_env|""> <user_ids_csv> <groq_key_file|""> <state_dir> <workspace_root>
+# Prints the channel.env to stdout; the bot token comes in $CHANNEL_ENV_TOKEN
+# (never argv). A value the operator left empty keeps what the existing file
+# already holds, so a re-run without answers does not blank the bot.
+render_channel_env() {
+    python3 - "$@" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+existing_path, user_ids_new, groq_file, state_dir, ws_root = sys.argv[1:6]
+
+existing: dict[str, str] = {}
+if existing_path and Path(existing_path).is_file():
+    for line in Path(existing_path).read_text().splitlines():
+        m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)=(.*)$", line)
+        if m:
+            existing[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+
+
+def csv(value: str) -> list[str]:
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+token = os.environ.get("CHANNEL_ENV_TOKEN", "").strip() or existing.get("TELEGRAM_BOT_TOKEN", "")
+if token and not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", token):
+    sys.exit("channel.env: TELEGRAM_BOT_TOKEN has an unexpected format")
+
+user_ids = csv(user_ids_new) or csv(existing.get("TELEGRAM_ALLOWED_USER_IDS", ""))
+for uid in user_ids:
+    if not re.fullmatch(r"[0-9]+", uid):
+        sys.exit(f"channel.env: user id {uid!r} is not a number")
+
+# DM chat id == user id. gate.ts drops every DM whose chat is not listed, so
+# the owner's id always goes in; ids added by hand (groups) stay.
+chat_ids = csv(existing.get("TELEGRAM_ALLOWED_CHAT_IDS", ""))
+chat_ids += [uid for uid in user_ids if uid not in chat_ids]
+
+groq = ""
+if groq_file and Path(groq_file).is_file():
+    groq = Path(groq_file).read_text().strip()
+groq = groq or existing.get("GROQ_API_KEY", "")
+
+managed = {
+    "TELEGRAM_BOT_TOKEN": token,
+    "TELEGRAM_ALLOWED_USER_IDS": ",".join(user_ids),
+    "TELEGRAM_ALLOWED_CHAT_IDS": ",".join(chat_ids),
+    "AGENT_ID": existing.get("AGENT_ID") or "jarvis",
+    "TELEGRAM_WORKSPACE_ROOT": existing.get("TELEGRAM_WORKSPACE_ROOT") or ws_root,
+    "TELEGRAM_STATE_DIR": existing.get("TELEGRAM_STATE_DIR") or state_dir,
+    "TELEGRAM_WEBHOOK_HOST": existing.get("TELEGRAM_WEBHOOK_HOST") or "127.0.0.1",
+    "TELEGRAM_WEBHOOK_PORT": existing.get("TELEGRAM_WEBHOOK_PORT") or "8089",
+}
+if groq:
+    managed["GROQ_API_KEY"] = groq
+
+for key, value in managed.items():
+    if re.search(r"[\s\"'\\]", value):
+        sys.exit(f"channel.env: {key} contains whitespace or quotes")
+
+out = [
+    "# Jarvis channel (dashi-plugin). Written by edgelab-install; a re-run keeps your values.",
+    "# Fill the three TELEGRAM_* lines (bot token from @BotFather, your numeric id",
+    "# from @userinfobot in BOTH id lines), then restart:",
+    "#   sudo systemctl enable channel-jarvis && sudo systemctl restart channel-jarvis",
+    "# TELEGRAM_ALLOWED_CHAT_IDS must contain your id too: without it every private",
+    "# message is dropped silently. Voice needs GROQ_API_KEY=<key> (optional).",
+    "# Do not add an empty TELEGRAM_EXPECTED_BOT_ID= line: the plugin refuses to start.",
+]
+out += [f"{k}={v}" for k, v in managed.items()]
+# The expected bot id is only the token prefix -- a stale copy after a bot
+# change would stop the plugin, so it is not carried over.
+extras = {k: v for k, v in existing.items() if k not in managed and k != "TELEGRAM_EXPECTED_BOT_ID"}
+if extras:
+    out.append("# --- kept from the previous file ---")
+    out += [f"{k}={v}" for k, v in extras.items()]
+print("\n".join(out))
+PY
+}
+
+# _accept_trust_dialog <claude_json> <project_dir> -- sets
+# projects[<dir>].hasTrustDialogAccepted=true, keeps every other key.
+_accept_trust_dialog() {
+    as_edgelab python3 - "$1" "$2" <<'PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+path, project = Path(sys.argv[1]), sys.argv[2]
+data: dict = {}
+mode = 0o600
+if path.exists():
+    try:
+        data = json.loads(path.read_text() or "{}")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{path}: not valid JSON ({exc}); left untouched")
+    if not isinstance(data, dict):
+        sys.exit(f"{path}: top level is not an object; left untouched")
+    mode = path.stat().st_mode & 0o777
+    backup = path.with_name(path.name + ".bak-edgelab-install")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+
+projects = data.setdefault("projects", {})
+if not isinstance(projects, dict):
+    sys.exit(f"{path}: 'projects' is not an object; left untouched")
+entry = projects.setdefault(project, {})
+if not isinstance(entry, dict):
+    sys.exit(f"{path}: projects[{project}] is not an object; left untouched")
+entry["hasTrustDialogAccepted"] = True
+# First TUI start otherwise stops on the theme picker, which nobody answers.
+data.setdefault("hasCompletedOnboarding", True)
+
+fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".claude.json.")
+with os.fdopen(fd, "w") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+PY
+}
+
+# _write_if_absent SRC DST MODE -- write_as_user, but an existing file wins
+# (the agent's CLAUDE.md and memory survive a re-run of the installer).
+_write_if_absent() {
+    if [[ -e "$2" ]]; then
+        return 0
+    fi
+    write_as_user "$@"
 }
 
 # _write_agent_workspace <wsroot> -- lays down CLAUDE.md + core/ tree for Jarvis.
@@ -760,7 +1008,7 @@ _write_agent_workspace() {
         USER_NAME  "$OPERATOR_NAME" \
         LANGUAGE   "$OPERATOR_LANGUAGE" \
         TIMEZONE   "$OPERATOR_TIMEZONE"
-    write_as_user "$claude_md_tmp" "${ws}/CLAUDE.md" 0644
+    _write_if_absent "$claude_md_tmp" "${ws}/CLAUDE.md" 0644
 
     # core/USER.md -- operator profile
     local user_tmp
@@ -776,7 +1024,7 @@ _write_agent_workspace() {
 ## Notes
 - Edit this file freely -- the agent reads it on every start.
 UEOF
-    write_as_user "$user_tmp" "${ws}/core/USER.md" 0644
+    _write_if_absent "$user_tmp" "${ws}/core/USER.md" 0644
 
     # core/rules.md
     local rules_tmp
@@ -790,7 +1038,7 @@ UEOF
 - On each correction: update LEARNINGS.md so the mistake does not repeat.
 - Prefer small, reversible changes.
 REOF
-    write_as_user "$rules_tmp" "${ws}/core/rules.md" 0644
+    _write_if_absent "$rules_tmp" "${ws}/core/rules.md" 0644
 
     # Stub cold memory + hot/warm files so @includes in CLAUDE.md resolve.
     local stub_tmp
@@ -798,19 +1046,19 @@ REOF
     TMPFILES+=("$stub_tmp")
 
     printf '# MEMORY.md\n\nLong-term notes.\n' > "$stub_tmp"
-    write_as_user "$stub_tmp" "${ws}/core/MEMORY.md" 0644
+    _write_if_absent "$stub_tmp" "${ws}/core/MEMORY.md" 0644
 
     printf '# LEARNINGS.md\n\nOne line per correction.\n' > "$stub_tmp"
-    write_as_user "$stub_tmp" "${ws}/core/LEARNINGS.md" 0644
+    _write_if_absent "$stub_tmp" "${ws}/core/LEARNINGS.md" 0644
 
     printf '# recent.md -- full journal (NOT in @include)\n' > "$stub_tmp"
-    write_as_user "$stub_tmp" "${ws}/core/hot/recent.md" 0644
+    _write_if_absent "$stub_tmp" "${ws}/core/hot/recent.md" 0644
 
     printf '# handoff.md -- last 10 entries (@include)\n' > "$stub_tmp"
-    write_as_user "$stub_tmp" "${ws}/core/hot/handoff.md" 0644
+    _write_if_absent "$stub_tmp" "${ws}/core/hot/handoff.md" 0644
 
     printf '# decisions.md -- last 14 days of decisions (@include)\n' > "$stub_tmp"
-    write_as_user "$stub_tmp" "${ws}/core/warm/decisions.md" 0644
+    _write_if_absent "$stub_tmp" "${ws}/core/warm/decisions.md" 0644
 }
 
 # =============================================================================
@@ -1051,7 +1299,8 @@ install_sudoers() {
 
     cat > "$tmp" <<SUDOERS
 # edgelab-install v${EDGELAB_VERSION} -- passwordless sudo for 'edgelab'.
-# Scope: systemctl + journalctl for two agent units, plus apt package mgmt
+# Scope: systemctl + journalctl for the agent units, plus apt package mgmt.
+# claude-gateway stays listed: it is the --rollback target on migrated servers.
 # (Day 1 contract: Richard can run 'sudo apt' for self-repair / package install).
 
 Cmnd_Alias EDGELAB_SYSTEMCTL = \\
@@ -1062,6 +1311,13 @@ Cmnd_Alias EDGELAB_SYSTEMCTL = \\
     /usr/bin/systemctl is-active claude-gateway, \\
     /usr/bin/systemctl enable claude-gateway, \\
     /usr/bin/systemctl disable claude-gateway, \\
+    /usr/bin/systemctl start ${JARVIS_UNIT}, \\
+    /usr/bin/systemctl stop ${JARVIS_UNIT}, \\
+    /usr/bin/systemctl restart ${JARVIS_UNIT}, \\
+    /usr/bin/systemctl status ${JARVIS_UNIT}, \\
+    /usr/bin/systemctl is-active ${JARVIS_UNIT}, \\
+    /usr/bin/systemctl enable ${JARVIS_UNIT}, \\
+    /usr/bin/systemctl disable ${JARVIS_UNIT}, \\
     /usr/bin/systemctl start claude-richard, \\
     /usr/bin/systemctl stop claude-richard, \\
     /usr/bin/systemctl restart claude-richard, \\
@@ -1074,6 +1330,8 @@ Cmnd_Alias EDGELAB_SYSTEMCTL = \\
 Cmnd_Alias EDGELAB_JOURNAL = \\
     /usr/bin/journalctl -u claude-gateway, \\
     /usr/bin/journalctl -u claude-gateway *, \\
+    /usr/bin/journalctl -u ${JARVIS_UNIT}, \\
+    /usr/bin/journalctl -u ${JARVIS_UNIT} *, \\
     /usr/bin/journalctl -u claude-richard, \\
     /usr/bin/journalctl -u claude-richard *
 
@@ -1218,19 +1476,25 @@ enable_services() {
 
     # Always enable (on-boot auto-start). If tokens are present we also try
     # start -- but only when OAuth credentials exist, otherwise the unit crashes.
-    if [[ -n "$JARVIS_BOT_TOKEN" ]]; then
-        systemctl enable claude-gateway.service --quiet
+    # Decide by the written channel.env: a token filled in by hand earlier
+    # counts even when this run got no answer.
+    if ! _env_has_value "${JARVIS_ENV_DIR}/channel.env" TELEGRAM_BOT_TOKEN; then
+        log "${JARVIS_UNIT} NOT enabled (no token) -- fill ${JARVIS_ENV_DIR}/channel.env, see the final notes."
+    elif ! _retire_legacy_gateway; then
+        # Two pollers on one bot token fight (409): no start while the old one runs.
+        warn "${JARVIS_UNIT} NOT started: old ${LEGACY_GATEWAY_UNIT} is still running. Stop it, then: sudo systemctl enable ${JARVIS_UNIT} && sudo systemctl restart ${JARVIS_UNIT}"
+    else
+        systemctl enable "${JARVIS_UNIT}.service" --quiet
         if [[ "$oauth_ready" == "yes" ]]; then
-            if systemctl start claude-gateway.service 2>/dev/null; then
-                ok "claude-gateway enabled + started."
+            # restart, not start: a re-run must pick up the new channel.env.
+            if systemctl restart "${JARVIS_UNIT}.service" 2>/dev/null; then
+                ok "${JARVIS_UNIT} enabled + started."
             else
-                warn "claude-gateway enabled, but start failed -- check 'journalctl -u claude-gateway'."
+                warn "${JARVIS_UNIT} enabled, but start failed -- check 'journalctl -u ${JARVIS_UNIT}'."
             fi
         else
-            log "claude-gateway enabled -- will start after OAuth under edgelab."
+            log "${JARVIS_UNIT} enabled -- will start after OAuth under edgelab."
         fi
-    else
-        log "claude-gateway NOT enabled (no token)."
     fi
 
     if [[ -n "$RICHARD_BOT_TOKEN" ]]; then
@@ -1247,6 +1511,74 @@ enable_services() {
     else
         log "claude-richard NOT enabled (no token)."
     fi
+}
+
+# _retire_legacy_gateway -- migrated server: back up and stop claude-gateway.
+# Its files stay on disk; `install.sh --rollback` turns it back on.
+# Returns 1 (gateway left as it was, or still active/enabled) when the backup
+# or the stop fails.
+_retire_legacy_gateway() {
+    local unit_file="/etc/systemd/system/${LEGACY_GATEWAY_UNIT}.service"
+    local legacy_dir="${EDGELAB_HOME}/${LEGACY_GATEWAY_DIR_NAME}"
+    if [[ ! -f "$unit_file" ]]; then
+        return 0
+    fi
+    if ! systemctl is-enabled --quiet "$LEGACY_GATEWAY_UNIT" 2>/dev/null \
+            && ! systemctl is-active --quiet "$LEGACY_GATEWAY_UNIT" 2>/dev/null; then
+        return 0    # already retired by an earlier run
+    fi
+
+    # No backup, no switch: the gateway keeps running untouched.
+    local backup_dir
+    backup_dir="${LEGACY_BACKUP_ROOT}/claude-gateway-$(date +%Y%m%d-%H%M%S)"
+    if ! install -d -m 0700 -o root -g root "$LEGACY_BACKUP_ROOT" "$backup_dir" \
+            || ! cp -a "$unit_file" "${backup_dir}/"; then
+        err "Backup of ${unit_file} to ${backup_dir} failed."
+        return 1
+    fi
+    if [[ -d "$legacy_dir" ]] && ! tar -C "$EDGELAB_HOME" --exclude="${LEGACY_GATEWAY_DIR_NAME}/.venv" \
+            -czf "${backup_dir}/claude-gateway-dir.tgz" "$LEGACY_GATEWAY_DIR_NAME"; then
+        err "Backup of ${legacy_dir} to ${backup_dir} failed."
+        return 1
+    fi
+
+    systemctl disable --now "${LEGACY_GATEWAY_UNIT}.service" --quiet || true
+    # Still running now, or enabled to come back at boot: both mean two pollers.
+    if systemctl is-active --quiet "$LEGACY_GATEWAY_UNIT" 2>/dev/null \
+            || systemctl is-enabled --quiet "$LEGACY_GATEWAY_UNIT" 2>/dev/null; then
+        err "Could not stop + disable ${LEGACY_GATEWAY_UNIT} (backup: ${backup_dir})."
+        return 1
+    fi
+    ok "Old ${LEGACY_GATEWAY_UNIT} stopped + disabled (backup: ${backup_dir}). Undo: sudo bash install.sh --rollback"
+}
+
+# =============================================================================
+# ROLLBACK (--rollback): Jarvis back to the old claude-gateway unit
+# =============================================================================
+
+rollback_to_gateway() {
+    if [[ $EUID -ne 0 ]]; then
+        die "Run as root: sudo $0 --rollback"
+    fi
+
+    if [[ ! -f "/etc/systemd/system/${LEGACY_GATEWAY_UNIT}.service" ]]; then
+        # Checked first: with nothing to return to, a working Jarvis stays up.
+        warn "No ${LEGACY_GATEWAY_UNIT} unit on this server (installed straight on the plugin) -- nothing to return to, ${JARVIS_UNIT} left as it is."
+        return 0
+    fi
+    if [[ -f "/etc/systemd/system/${JARVIS_UNIT}.service" ]]; then
+        systemctl disable --now "${JARVIS_UNIT}.service" --quiet || true
+        if systemctl is-active --quiet "$JARVIS_UNIT" 2>/dev/null \
+                || systemctl is-enabled --quiet "$JARVIS_UNIT" 2>/dev/null; then
+            die "Could not stop + disable ${JARVIS_UNIT}; not starting ${LEGACY_GATEWAY_UNIT} next to it (one bot token, two pollers)."
+        fi
+        ok "${JARVIS_UNIT} stopped + disabled (plugin files kept)."
+    fi
+
+    systemctl daemon-reload
+    systemctl enable --now "${LEGACY_GATEWAY_UNIT}.service" --quiet \
+        || die "Could not start ${LEGACY_GATEWAY_UNIT} -- check 'journalctl -u ${LEGACY_GATEWAY_UNIT}'."
+    ok "${LEGACY_GATEWAY_UNIT} enabled + started. Switch to the plugin again: sudo bash install.sh"
 }
 
 # =============================================================================
@@ -1271,7 +1603,8 @@ $(printf '%b' "$C_GREEN")=======================================================
 Installed on this VPS:
   - User:      ${EDGELAB_USER} (${EDGELAB_HOME})
   - Claude:    ${EDGELAB_HOME}/.local/bin/claude  (per-user, on PATH)
-  - Jarvis:    ${EDGELAB_HOME}/${JARVIS_DIR_NAME}  (systemd: claude-gateway)
+  - Jarvis:    ${EDGELAB_HOME}/.claude-lab/jarvis/.claude/dashi-plugin-claude-code  (systemd: ${JARVIS_UNIT})
+               env: ${JARVIS_ENV_DIR}/channel.env
   - Richard:   ${RICHARD_HOME}                       (systemd: claude-richard)
   - Skills:    ${EDGELAB_HOME}/.claude-lab/jarvis/.claude/skills/  (10 skills)
   - Plugin:    ${EDGELAB_HOME}/.claude/plugins/superpowers/
@@ -1289,12 +1622,20 @@ $(printf '%b' "$C_BOLD")NEXT STEPS -- these are for the root-Claude agent, not t
 
   $(printf '%b' "$C_YELLOW")2.$(printf '%b' "$C_NC") If tokens were skipped during install, fill them now and restart:
 
-        # Jarvis: edit ${EDGELAB_HOME}/${JARVIS_DIR_NAME}/config.json --
-        # set agents.jarvis.bot_token and allowed_user_ids=[<your id>]
+        # Jarvis: ${JARVIS_ENV_DIR}/channel.env --
+        #   TELEGRAM_BOT_TOKEN=<token>, and your id in BOTH
+        #   TELEGRAM_ALLOWED_USER_IDS=<id> and TELEGRAM_ALLOWED_CHAT_IDS=<id>
         # Richard: ${RICHARD_HOME}/.env -- TELEGRAM_BOT_TOKEN=..., ALLOWED_USERS=<id>
 
-        sudo systemctl restart claude-gateway claude-richard
-        sudo systemctl status  claude-gateway claude-richard --no-pager
+        sudo systemctl enable ${JARVIS_UNIT} claude-richard
+        sudo systemctl restart ${JARVIS_UNIT} claude-richard
+        sudo systemctl status  ${JARVIS_UNIT} claude-richard --no-pager
+        sudo journalctl -u ${JARVIS_UNIT} -f       # Jarvis logs
+        sudo -u ${EDGELAB_USER} tmux -L ${JARVIS_UNIT} capture-pane -p -t ${JARVIS_UNIT} | tail -30   # Jarvis screen
+
+      Undo the switch to the plugin (servers that had claude-gateway):
+
+        sudo bash install.sh --rollback
 
   $(printf '%b' "$C_YELLOW")3.$(printf '%b' "$C_NC") Smoke-checks:
 
@@ -1303,7 +1644,7 @@ $(printf '%b' "$C_BOLD")NEXT STEPS -- these are for the root-Claude agent, not t
         python3 --version                                       # 3.12+
         sudo -u ${EDGELAB_USER} bash -lc 'which claude'         # ${EDGELAB_HOME}/.local/bin/claude
         ls ${EDGELAB_HOME}/.claude-lab/jarvis/.claude/          # CLAUDE.md, core/, skills/
-        systemctl is-active claude-gateway                      # active (after steps 1+2)
+        systemctl is-active ${JARVIS_UNIT}                       # active (after steps 1+2)
         systemctl is-active claude-richard                      # active (after steps 1+2)
         ls -la /etc/sudoers.d/edgelab-agents                    # exists, 0440
         ls ${EDGELAB_HOME}/.claude-lab/jarvis/.claude/skills/ | wc -l   # 10
@@ -1320,12 +1661,18 @@ EOF
 # =============================================================================
 
 main() {
+    if [[ "${1:-}" == "--rollback" ]]; then
+        rollback_to_gateway
+        return 0
+    fi
+
     banner
     preflight
     install_apt_deps
     install_node
     ensure_edgelab_user
     install_claude_cli
+    install_bun
     collect_inputs
     install_jarvis
     install_richard
@@ -1338,4 +1685,7 @@ main() {
     final_instructions
 }
 
-main "$@"
+# Tests source this file with INSTALL_SH_SOURCED_FOR_TESTING=1 to reach helpers.
+if [[ "${INSTALL_SH_SOURCED_FOR_TESTING:-0}" != "1" ]]; then
+    main "$@"
+fi
