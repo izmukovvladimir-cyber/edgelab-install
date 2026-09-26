@@ -419,6 +419,94 @@ check "final: claude auth login"    grep -q "bash -lc 'claude auth login'" "${TD
 check "final: no bare claude login" bash -c "! grep -q \"'claude login'\" '${TDIR}/final.txt'"
 check "header: claude auth login"   grep -q "claude auth login" "${REPO}/install.sh"
 
+# --- apt: only missing packages, installed ones never upgraded -------------------
+APT_LOG="${TDIR}/apt.log"
+INSTALLED=" systemd sudo curl git ca-certificates python3 "
+dpkg-query() {
+    local pkg=${*: -1}
+    if [[ "$INSTALLED" == *" ${pkg} "* ]]; then printf 'install ok installed'; else return 1; fi
+}
+# Dry run (-s): "bigpkg" would upgrade installed systemd, "brokenpkg" does
+# not resolve, everything else is a plain new install.
+apt_get() {
+    if [[ " $* " == *" -s "* ]]; then
+        [[ " $* " == *" brokenpkg "* ]] && return 100
+        local a
+        for a in "$@"; do
+            case $a in
+                bigpkg) printf 'Inst systemd [255.4-1ubuntu8.4] (255.4-1ubuntu8.17 Ubuntu:24.04 [amd64])\nInst bigpkg (1.0 Ubuntu:24.04 [amd64])\n' ;;
+                -*|install) ;;
+                *) printf 'Inst %s (1.0 Ubuntu:24.04 [amd64])\n' "$a" ;;
+            esac
+        done
+        return 0
+    fi
+    printf '%s\n' "$*" >>"$APT_LOG"
+}
+: >"$APT_LOG"
+apt_install_missing systemd sudo tmux unzip
+check "apt: only missing installed"  grep -qx 'install -y -qq --no-upgrade tmux unzip' "$APT_LOG"
+check "apt: installed pkg untouched" bash -c "! grep -qw systemd '$APT_LOG'"
+: >"$APT_LOG"
+apt_install_missing systemd sudo
+check "apt: all present -> no install call" test ! -s "$APT_LOG"
+: >"$APT_LOG"
+OUT=$(apt_install_missing tmux bigpkg unzip brokenpkg 2>&1)
+check "apt dep-upgrade: safe ones installed"   bash -c "grep -qx 'install -y -qq --no-upgrade tmux' '$APT_LOG' && grep -qx 'install -y -qq --no-upgrade unzip' '$APT_LOG'"
+check "apt dep-upgrade: bigpkg skipped"        bash -c "! grep -qw bigpkg '$APT_LOG'"
+check "apt dep-upgrade: warns with systemd"    grep -q 'bigpkg NOT installed.*systemd' <<<"$OUT"
+check "apt unresolvable: skipped + warned"     grep -q 'brokenpkg NOT installed.*cannot resolve' <<<"$OUT"
+: >"$APT_LOG"
+apt_install_missing bigpkg >/dev/null 2>&1
+check "apt dep-upgrade only: no install call"  test ! -s "$APT_LOG"
+# pkgA and pkgB are each fine alone but together upgrade systemd: the joint
+# install must never run; each one goes alone after its own dry run.
+apt_get() {
+    if [[ " $* " == *" -s "* ]]; then
+        if [[ " $* " == *" pkgA "* && " $* " == *" pkgB "* ]]; then
+            printf 'Inst systemd [1] (2 Ubuntu [amd64])\n'
+        fi
+        return 0
+    fi
+    printf '%s\n' "$*" >>"$APT_LOG"
+}
+: >"$APT_LOG"
+apt_install_missing pkgA pkgB >/dev/null 2>&1
+check "apt joint-only upgrade: no joint install" bash -c "! grep -q 'pkgA pkgB' '$APT_LOG'"
+check "apt joint-only upgrade: one by one"       bash -c "grep -qx 'install -y -qq --no-upgrade pkgA' '$APT_LOG' && grep -qx 'install -y -qq --no-upgrade pkgB' '$APT_LOG'"
+: >"$APT_LOG"
+( step() { :; }; add-apt-repository() { :; }; update-alternatives() { :; }; install_apt_deps ) >/dev/null 2>&1
+check "apt deps: update still runs"       grep -qx 'update -qq' "$APT_LOG"
+check "apt deps: never installs systemd"  bash -c "! grep -E '^install' '$APT_LOG' | grep -qwE 'systemd|sudo|curl|git|ca-certificates'"
+check "apt deps: installs a missing one"  bash -c "grep -E '^install' '$APT_LOG' | grep -qw tmux"
+check "apt deps: every install is --no-upgrade" bash -c "! grep -E '^install' '$APT_LOG' | grep -vq -- '--no-upgrade'"
+unset -f dpkg-query apt_get
+
+# --- node: >= 22 left alone, older replaced, not-runnable-as-edgelab warns --------
+NODE_VER="v24.21.0"; CURL_LOG="${TDIR}/curl.log"
+node() { printf '%s\n' "$NODE_VER"; }
+curl() { printf '%s\n' "$*" >>"$CURL_LOG"; }
+apt_get() { printf '%s\n' "$*" >>"$CURL_LOG"; }
+step() { :; }
+: >"$CURL_LOG"; ( install_node ) >/dev/null 2>&1
+check "node v24: no nodesource"   test ! -s "$CURL_LOG"
+NODE_VER="v22.1.0"; : >"$CURL_LOG"; ( install_node ) >/dev/null 2>&1
+check "node v22: no nodesource"   test ! -s "$CURL_LOG"
+NODE_VER="v20.11.1"; : >"$CURL_LOG"; ( install_node ) >/dev/null 2>&1
+check "node v20: nodesource used" grep -q 'nodesource' "$CURL_LOG"
+NODE_VER="v100.0.0"; : >"$CURL_LOG"; ( install_node ) >/dev/null 2>&1
+check "node v100: numeric compare, left" test ! -s "$CURL_LOG"
+unset -f curl apt_get
+
+as_edgelab() { return 1; }
+OUT=$( (check_node_for_edgelab; printf 'rc=%s' "$?") 2>&1 )
+check "node as edgelab fails: warns"     grep -q 'does not run as' <<<"$OUT"
+check "node as edgelab fails: rc 0"      grep -q 'rc=0$' <<<"$OUT"
+as_edgelab() { "$@"; }
+OUT=$( (check_node_for_edgelab; printf 'rc=%s' "$?") 2>&1 )
+check "node as edgelab ok: silent"       test "$OUT" = "rc=0"
+unset -f node
+
 # --- sourcing does not run main -------------------------------------------------
 check "guard: sourcing did not install anything" test ! -e "${FAKE_HOME}/.local/bin/claude"
 

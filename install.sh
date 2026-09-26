@@ -431,11 +431,57 @@ preflight() {
 # STEP 1: APT DEPENDENCIES
 # =============================================================================
 
+# _apt_touches_installed PKG... -- dry run; prints the already installed
+# packages the install would upgrade or remove. Returns 1 when apt cannot
+# resolve the install at all.
+_apt_touches_installed() {
+    local sim
+    if ! sim=$(apt_get install -s -y --no-upgrade "$@" 2>/dev/null); then
+        return 1
+    fi
+    awk '/^Inst [^ ]+ \[/ {print $2} /^Remv / {print $2}' <<<"$sim" | sort -u | tr '\n' ' '
+}
+
+# apt_install_missing PKG... -- installs only packages that are not installed
+# yet; installed ones are never upgraded (on a lived-in server an upgrade of
+# systemd / udev / resolved / sudo restarts them under other people's services).
+# --no-upgrade covers only the named packages, so a dry run guards their
+# dependencies: a package that would upgrade/remove anything installed is
+# skipped with a warning and the command to run by hand.
+apt_install_missing() {
+    local pkg missing=() touched
+    for pkg in "$@"; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+            continue
+        fi
+        missing+=("$pkg")
+    done
+    if ((${#missing[@]} == 0)); then
+        return 0
+    fi
+
+    if touched=$(_apt_touches_installed "${missing[@]}") && [[ -z "${touched// /}" ]]; then
+        log "apt: installing missing ${missing[*]}"
+        apt_get install -y -qq --no-upgrade "${missing[@]}"
+        return 0
+    fi
+    # Together they touch something installed: one by one, each dry-run
+    # right before its own install (a set is only as safe as its own run).
+    for pkg in "${missing[@]}"; do
+        if touched=$(_apt_touches_installed "$pkg") && [[ -z "${touched// /}" ]]; then
+            log "apt: installing missing ${pkg}"
+            apt_get install -y -qq --no-upgrade "$pkg"
+        else
+            warn "apt: ${pkg} NOT installed -- it would upgrade/remove installed packages: ${touched:-apt cannot resolve it}. If that is fine: sudo apt-get install ${pkg}"
+        fi
+    done
+}
+
 install_apt_deps() {
     step 1 "Installing apt dependencies"
 
     apt_get update -qq
-    apt_get install -y -qq \
+    apt_install_missing \
         ca-certificates gnupg lsb-release software-properties-common \
         sudo \
         curl wget git jq rsync \
@@ -456,13 +502,13 @@ install_apt_deps() {
                 add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
                 apt_get update -qq
             fi
-            apt_get install -y -qq python3.12 python3.12-venv python3.12-dev python3-pip
+            apt_install_missing python3.12 python3.12-venv python3.12-dev python3-pip
             # Point /usr/bin/python3 -> python3.12 so `python3 --version` shows 3.12.
             update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 100 >/dev/null 2>&1 || true
             update-alternatives --set python3 /usr/bin/python3.12 >/dev/null 2>&1 || true
             ;;
         24.04|*)
-            apt_get install -y -qq python3 python3-venv python3-pip python3-dev
+            apt_install_missing python3 python3-venv python3-pip python3-dev
             ;;
     esac
 
@@ -481,16 +527,30 @@ install_node() {
     if command -v node &>/dev/null; then
         local current_major
         current_major=$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/')
-        if [[ "$current_major" == "$NODE_MAJOR" ]]; then
-            ok "Node.js $(node -v) already installed."
+        # v22 or newer is fine and is not ours to touch (may be another
+        # tool's node, e.g. a /usr/local/bin symlink).
+        if [[ "$current_major" =~ ^[0-9]+$ ]] && ((current_major >= NODE_MAJOR)); then
+            ok "Node.js $(node -v) already installed (>= v${NODE_MAJOR}) -- left as is."
             return 0
         fi
-        warn "Node.js $(node -v) present but not v${NODE_MAJOR}; replacing."
+        warn "Node.js $(node -v) present but older than v${NODE_MAJOR}; installing v${NODE_MAJOR}."
     fi
 
     curl "${CURL_OPTS[@]}" "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
     apt_get install -y -qq nodejs
     ok "Node.js $(node -v) installed."
+}
+
+# check_node_for_edgelab -- warn only. No installer step needs node (Claude
+# CLI is a native binary, the plugin runs on Bun); a node the agent cannot run
+# (symlink into a 0700 /root) is reported, never replaced.
+check_node_for_edgelab() {
+    if as_edgelab node -v >/dev/null 2>&1; then
+        return 0
+    fi
+    local where
+    where=$(command -v node 2>/dev/null || echo "not on PATH")
+    warn "node does not run as ${EDGELAB_USER} (${where} -> $(readlink -f "$where" 2>/dev/null || echo '?')). Left as is: the install does not need it; agents that call node will fail until it is fixed."
 }
 
 # =============================================================================
@@ -1729,7 +1789,7 @@ $(printf '%b' "$C_BOLD")NEXT STEPS -- these are for the root-Claude agent, not t
   $(printf '%b' "$C_YELLOW")3.$(printf '%b' "$C_NC") Smoke-checks:
 
         id ${EDGELAB_USER}                                      # uid >= 1000
-        node -v                                                 # v22.x
+        node -v                                                 # v22+
         python3 --version                                       # 3.12+
         sudo -u ${EDGELAB_USER} bash -lc 'which claude'         # ${EDGELAB_HOME}/.local/bin/claude
         ls ${EDGELAB_HOME}/.claude-lab/jarvis/.claude/          # CLAUDE.md, core/, skills/
@@ -1760,6 +1820,7 @@ main() {
     install_apt_deps
     install_node
     ensure_edgelab_user
+    check_node_for_edgelab
     install_claude_cli
     install_bun
     collect_inputs
