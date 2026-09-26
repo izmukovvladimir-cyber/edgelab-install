@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016,SC2034,SC2329  # eval strings, globals read by sourced fns, overrides
+# shellcheck disable=SC2016,SC2034,SC2059,SC2329  # eval strings, globals read by sourced fns, overrides
 # Tests for the dashi-plugin (channel-jarvis) part of install.sh, no root needed:
 #   channel.env rendering + merge on re-run, folder-trust edit of ~/.claude.json,
 #   unit template, sudoers entries, migration inputs from the old gateway,
@@ -33,6 +33,7 @@ mkdir -p "${TDIR}/systemd" "${TDIR}/etc-jarvis" "${TDIR}/backups"
 sed -e "s#^readonly EDGELAB_HOME=.*#readonly EDGELAB_HOME=\"${FAKE_HOME}\"#" \
     -e "s#^readonly JARVIS_ENV_DIR=.*#readonly JARVIS_ENV_DIR=\"${TDIR}/etc-jarvis\"#" \
     -e "s#^readonly LEGACY_BACKUP_ROOT=.*#readonly LEGACY_BACKUP_ROOT=\"${TDIR}/backups\"#" \
+    -e "s#^readonly RICHARD_HOME=.*#readonly RICHARD_HOME=\"${TDIR}/richard\"#" \
     -e "s#/etc/systemd/system/#${TDIR}/systemd/#g" \
     -e 's#\$EUID -ne 0 ]]#$EUID -ne 0 \&\& -z "${TEST_AS_ROOT:-}" ]]#' \
     "${REPO}/install.sh" >"${TDIR}/install.sh"
@@ -326,6 +327,97 @@ _write_agent_workspace_test() {
 _write_agent_workspace_test
 check "workspace: existing file kept" test "$(cat "${WS}/core/hot/handoff.md")" = "MY MEMORY"
 check "workspace: missing file written" test "$(cat "${WS}/core/new.md")" = "stub"
+
+# --- prompt_or_env without a tty: like Enter, never dies -----------------------
+unset EDGELAB_TEST_ANSWER
+R1=$( (EDGELAB_NONINTERACTIVE=1 prompt_or_env V EDGELAB_TEST_ANSWER "q" "" --secret </dev/null 2>/dev/null; printf 'rc=%s v=[%s]' "$?" "$V") )
+check "no tty, no default: rc 0, empty" test "$R1" = "rc=0 v=[]"
+R2=$( (prompt_or_env V EDGELAB_TEST_ANSWER "q" "Russian" </dev/null 2>/dev/null; printf 'rc=%s v=[%s]' "$?" "$V") )
+check "no tty, default used"            test "$R2" = "rc=0 v=[Russian]"
+R3=$( (EDGELAB_TEST_ANSWER=from_env prompt_or_env V EDGELAB_TEST_ANSWER "q" "" </dev/null 2>/dev/null; printf 'rc=%s v=[%s]' "$?" "$V") )
+check "no tty, env wins"                test "$R3" = "rc=0 v=[from_env]"
+R4=$( (EDGELAB_NONINTERACTIVE=1 collect_inputs </dev/null >/dev/null 2>&1; printf 'rc=%s' "$?") )
+check "no tty: collect_inputs survives with no tokens" test "$R4" = "rc=0"
+
+# --- merge_env_file ---------------------------------------------------------------
+REND="${TDIR}/rend.env"; OLD="${TDIR}/old.env"
+printf '# c\nTELEGRAM_BOT_TOKEN=\nTELEGRAM_BOT_USERNAME=\nALLOWED_USERS=\nENVIRONMENT=production\nNEW_KEY=1\n' >"$REND"
+printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_BOT_USERNAME=rbot\nALLOWED_USERS=555\nENVIRONMENT=dev\nMY_OWN=x\n' "$TOKEN" >"$OLD"
+merge_env_file "$REND" "$OLD" TELEGRAM_BOT_TOKEN,TELEGRAM_BOT_USERNAME,ALLOWED_USERS >"${TDIR}/m1"
+check "merge: empty answer keeps token" has "${TDIR}/m1" "TELEGRAM_BOT_TOKEN=${TOKEN}"
+check "merge: empty answer keeps users" has "${TDIR}/m1" "ALLOWED_USERS=555"
+check "merge: hand edit kept"           has "${TDIR}/m1" "ENVIRONMENT=dev"
+check "merge: extra key kept"           has "${TDIR}/m1" "MY_OWN=x"
+check "merge: new template key added"   has "${TDIR}/m1" "NEW_KEY=1"
+check "merge: comments from template"   has "${TDIR}/m1" "# c"
+printf 'TELEGRAM_BOT_TOKEN=%s\nALLOWED_USERS=999\n' "$TOKEN2" >"$REND"
+merge_env_file "$REND" "$OLD" TELEGRAM_BOT_TOKEN,TELEGRAM_BOT_USERNAME,ALLOWED_USERS >"${TDIR}/m2"
+check "merge: new answer wins (token)"  has "${TDIR}/m2" "TELEGRAM_BOT_TOKEN=${TOKEN2}"
+check "merge: new answer wins (users)"  has "${TDIR}/m2" "ALLOWED_USERS=999"
+printf 'TELEGRAM_BOT_TOKEN=\nANTHROPIC_API_KEY=\n' >"$REND"
+printf 'export TELEGRAM_BOT_TOKEN = %s\nANTHROPIC_API_KEY = sk-x\nexport MY_EXP=1\nQ="a \\"b\\" c"\n' "$TOKEN" >"$OLD"
+merge_env_file "$REND" "$OLD" TELEGRAM_BOT_TOKEN >"${TDIR}/m3"
+check "merge: export/space answer key kept" has "${TDIR}/m3" "TELEGRAM_BOT_TOKEN=${TOKEN}"
+check "merge: spaced other key kept"        has "${TDIR}/m3" "ANTHROPIC_API_KEY=sk-x"
+check "merge: export extra kept"            has "${TDIR}/m3" "MY_EXP=1"
+check "merge: escaped quotes one line kept" has "${TDIR}/m3" 'Q="a \"b\" c"'
+for bad in 'MY_OWN="first\nsecond"\nANOTHER=ok\n' 'MY_OWN="first \\"\nsecond"\nANOTHER=ok\n' "MY_OWN='open\nANOTHER=ok\n" 'weird line\nANOTHER=ok\n' \
+        "T=a\nMY_OWN='first \\\\'\nU=b\nTAIL=end'\n" 'T=a\nT=b\n' \
+        'LOCAL_ROOT=/srv\nAPPROVED_DIRECTORY=${LOCAL_ROOT}\n'; do
+    printf "$bad" >"$OLD"
+    merge_env_file "$REND" "$OLD" TELEGRAM_BOT_TOKEN >/dev/null 2>&1
+    rc=$?
+    check "merge: unsafe file -> exit 3 ($(head -1 "$OLD"))" test "$rc" -eq 3
+done
+
+# --- install_richard re-run with empty answers keeps Richard alive ---------------
+RH="${TDIR}/richard"
+mkdir -p "${RH}/venv/bin"
+printf '#!/bin/sh\n' >"${RH}/venv/bin/python"; printf '#!/bin/sh\n' >"${RH}/venv/bin/claude-telegram-bot"
+chmod +x "${RH}/venv/bin/python" "${RH}/venv/bin/claude-telegram-bot"
+printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_BOT_USERNAME=rbot\nALLOWED_USERS=555\nMY_OWN=x\n' "$TOKEN2" >"${RH}/.env"
+sudo() { :; }
+install() {
+    local args=()
+    while (($#)); do case $1 in -o|-g|-m) shift 2 ;; *) args+=("$1"); shift ;; esac; done
+    command install "${args[@]}"
+}
+RICHARD_BOT_TOKEN=""; RICHARD_BOT_USERNAME=""; TG_USER_ID=""
+install_richard >/dev/null 2>&1
+check "richard rerun: token kept"    has "${RH}/.env" "TELEGRAM_BOT_TOKEN=${TOKEN2}"
+check "richard rerun: users kept"    has "${RH}/.env" "ALLOWED_USERS=555"
+check "richard rerun: own line kept" has "${RH}/.env" "MY_OWN=x"
+check "richard rerun: template keys" has "${RH}/.env" "USE_SDK=true"
+check "richard rerun: backup made"   bash -c "ls '${RH}'/.env.bak-* >/dev/null 2>&1"
+check "richard rerun: backup = old"  bash -c "grep -qx 'MY_OWN=x' '${RH}'/.env.bak-* && ! grep -q '^USE_SDK' '${RH}'/.env.bak-*"
+N_BAK=$(find "$RH" -name '.env.bak-*' | wc -l)
+install_richard >/dev/null 2>&1
+check "richard rerun: unchanged -> no new backup" test "$(find "$RH" -name '.env.bak-*' | wc -l)" = "$N_BAK"
+rm -f "${RH}/.env"
+RICHARD_BOT_TOKEN="$TOKEN"; TG_USER_ID="777"
+install_richard >/dev/null 2>&1
+check "richard fresh: token written" has "${RH}/.env" "TELEGRAM_BOT_TOKEN=${TOKEN}"
+check "richard fresh: users written" has "${RH}/.env" "ALLOWED_USERS=777"
+printf 'TELEGRAM_BOT_TOKEN=%s\nMY_OWN="first \\"\nsecond"\nANOTHER=ok\n' "$TOKEN" >"${RH}/.env"
+cp "${RH}/.env" "${TDIR}/richard-ml.orig"
+RICHARD_BOT_TOKEN=""; TG_USER_ID=""
+install_richard >/dev/null 2>&1
+check "richard multi-line: file untouched" cmp -s "${RH}/.env" "${TDIR}/richard-ml.orig"
+printf "TELEGRAM_BOT_TOKEN=%s\nMY_OWN='first \\\\'\nTELEGRAM_BOT_TOKEN=wrong\nTAIL=end'\n" "$TOKEN" >"${RH}/.env"
+cp "${RH}/.env" "${TDIR}/richard-sq.orig"
+install_richard >/dev/null 2>&1
+check "richard single-quote backslash: file untouched" cmp -s "${RH}/.env" "${TDIR}/richard-sq.orig"
+printf 'TELEGRAM_BOT_TOKEN=%s\nLOCAL_ROOT=/srv/richard\nAPPROVED_DIRECTORY=${LOCAL_ROOT}\n' "$TOKEN" >"${RH}/.env"
+cp "${RH}/.env" "${TDIR}/richard-interp.orig"
+install_richard >/dev/null 2>&1
+check "richard interpolation: file untouched" cmp -s "${RH}/.env" "${TDIR}/richard-interp.orig"
+unset -f sudo install
+
+# --- final notes point at `claude auth login` ------------------------------------
+final_instructions >"${TDIR}/final.txt" 2>&1
+check "final: claude auth login"    grep -q "bash -lc 'claude auth login'" "${TDIR}/final.txt"
+check "final: no bare claude login" bash -c "! grep -q \"'claude login'\" '${TDIR}/final.txt'"
+check "header: claude auth login"   grep -q "claude auth login" "${REPO}/install.sh"
 
 # --- sourcing does not run main -------------------------------------------------
 check "guard: sourcing did not install anything" test ! -e "${FAKE_HOME}/.local/bin/claude"

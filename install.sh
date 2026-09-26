@@ -9,7 +9,7 @@
 #   - Richard: izmukovvladimir-cyber/claude-code-telegram v1.6.0 -> systemd unit claude-richard
 #
 # Both agents share Anthropic Max OAuth from /home/edgelab/.claude/
-# Operator runs `sudo -u edgelab claude login` once after install finishes.
+# Operator runs `sudo -u edgelab -i bash -lc 'claude auth login'` once after install finishes.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/izmukovvladimir-cyber/edgelab-install/main/install.sh -o install.sh && sudo bash install.sh
@@ -157,11 +157,13 @@ prompt_or_env() {
     fi
 
     if is_noninteractive; then
-        if [[ -n "$default" ]]; then
-            out_ref="$default"
-            return 0
+        # No tty (root-Claude runs the installer that way): behave like Enter.
+        # An empty token keeps the value already written on this server.
+        if [[ -z "$default" ]]; then
+            warn "Non-interactive: ${env_name} not set -- left empty (an existing value on this server is kept)."
         fi
-        die "Non-interactive mode: required value ${env_name} is missing (prompt was: ${prompt})."
+        out_ref="$default"
+        return 0
     fi
 
     local answer=""
@@ -930,6 +932,70 @@ print("\n".join(out))
 PY
 }
 
+# merge_env_file <rendered> <existing> <answer_keys_csv> -- prints the merged
+# KEY=VALUE file. Answer keys: the rendered (operator) value wins unless it is
+# empty. Every other key: the existing value wins (hand edits survive).
+# Keys only in the existing file are kept at the end. Comments follow the
+# rendered file. Exit 3: the existing file has something this parser does not
+# fully understand (multi-line value, odd line, repeated key, $-interpolation)
+# -- keep that file as it is.
+merge_env_file() {
+    python3 - "$@" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+rendered_path, existing_path, answer_csv = sys.argv[1:4]
+answer_keys = {k for k in answer_csv.split(",") if k}
+line_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# The existing file may be hand-edited: accept `export KEY = value` too.
+# Anything this parser does not fully understand (a quote that does not close
+# on its own line, a line that is not KEY=value) -> exit 3, file kept as is.
+existing_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+closed_re = re.compile(r"""^(?:"(?:[^"\\]|\\.)*"|'[^'\\]*')$""")
+
+existing: dict[str, str] = {}
+for line in Path(existing_path).read_text().splitlines():
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    m = existing_re.match(line)
+    if not m:
+        sys.exit(3)
+    value = m.group(2)
+    if value[:1] in ("'", '"') and not closed_re.match(value):
+        sys.exit(3)
+    if m.group(1) in existing:    # repeated key: which one wins is not ours to guess
+        sys.exit(3)
+    if "$" in value:              # interpolation depends on line order we change
+        sys.exit(3)
+    existing[m.group(1)] = value
+
+out: list[str] = []
+seen: set[str] = set()
+for line in Path(rendered_path).read_text().splitlines():
+    m = line_re.match(line)
+    if not m:
+        out.append(line)
+        continue
+    key, value = m.group(1), m.group(2)
+    seen.add(key)
+    if key in existing:
+        if key in answer_keys:
+            if not value.strip():
+                value = existing[key]
+        else:
+            value = existing[key]
+    out.append(f"{key}={value}")
+
+extras = [(k, v) for k, v in existing.items() if k not in seen]
+if extras:
+    out.append("")
+    out.append("# --- kept from the previous file ---")
+    out += [f"{k}={v}" for k, v in extras]
+print("\n".join(out))
+PY
+}
+
 # _accept_trust_dialog <claude_json> <project_dir> -- sets
 # projects[<dir>].hasTrustDialogAccepted=true, keeps every other key.
 _accept_trust_dialog() {
@@ -1090,7 +1156,30 @@ install_richard() {
         RICHARD_BOT_USERNAME "$RICHARD_BOT_USERNAME" \
         TG_USER_ID           "$TG_USER_ID" \
         USER                 "$EDGELAB_USER"
-    install_as_user "$env_tmp" "${RICHARD_HOME}/.env" "$EDGELAB_USER" 0600
+    # Re-run (migration): an Enter on the token / id questions must not
+    # blank a working Richard -- merge with the existing .env, back it up.
+    local richard_env="${RICHARD_HOME}/.env"
+    if [[ -f "$richard_env" ]]; then
+        local merged_tmp
+        merged_tmp=$(mktemp)
+        TMPFILES+=("$merged_tmp")
+        local merge_rc=0
+        merge_env_file "$env_tmp" "$richard_env" \
+            TELEGRAM_BOT_TOKEN,TELEGRAM_BOT_USERNAME,ALLOWED_USERS >"$merged_tmp" \
+            || merge_rc=$?
+        if [[ "$merge_rc" -eq 3 ]]; then
+            warn "${richard_env} has lines the installer cannot merge safely -- left as it is (edit it by hand if needed)."
+            cp "$richard_env" "$merged_tmp"
+        elif [[ "$merge_rc" -ne 0 ]]; then
+            die "Could not merge ${richard_env}."
+        fi
+        if ! cmp -s "$merged_tmp" "$richard_env"; then
+            install -m 0600 -o "$EDGELAB_USER" -g "$EDGELAB_USER" \
+                "$richard_env" "${richard_env}.bak-$(date +%Y%m%d-%H%M%S)"
+        fi
+        mv "$merged_tmp" "$env_tmp"
+    fi
+    install_as_user "$env_tmp" "$richard_env" "$EDGELAB_USER" 0600
     rm -f "$env_tmp"
 
     # systemd unit
@@ -1616,7 +1705,7 @@ $(printf '%b' "$C_BOLD")NEXT STEPS -- these are for the root-Claude agent, not t
 
   $(printf '%b' "$C_YELLOW")1.$(printf '%b' "$C_NC") One-time Anthropic OAuth under edgelab (interactive -- opens browser):
 
-        sudo -u ${EDGELAB_USER} -i bash -lc 'claude login'
+        sudo -u ${EDGELAB_USER} -i bash -lc 'claude auth login'
 
       Credentials land in ${EDGELAB_HOME}/.claude/ and are shared by both agents.
 
