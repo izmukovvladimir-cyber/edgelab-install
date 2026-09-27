@@ -1,0 +1,137 @@
+"""Richard launcher: start claude-code-telegram with the Telegram bot token masked in output.
+
+python-telegram-bot talks to https://api.telegram.org/bot<TOKEN>/..., and httpx logs
+every request URL at INFO. claude-code-telegram sends all logging to stdout, which the
+systemd unit forwards to journald, so without this launcher the bot token lands in
+the system journal in clear text (thousands of lines a day from getUpdates polling).
+
+The fix lives here, outside the package's site-packages, so a pip upgrade of
+claude-code-telegram does not undo it:
+  * sys.stdout and sys.stderr are wrapped before the package starts, so every
+    Python-level write is masked at the output boundary: logging handlers
+    (basicConfig binds the wrapped stream), print(), sys.excepthook,
+    threading.excepthook, sys.unraisablehook, sys.exit(<message>), and the
+    binary sys.stdout.buffer / sys.stderr.buffer;
+  * the configured token (TELEGRAM_BOT_TOKEN) is replaced exactly, and anything
+    shaped like a bot token is replaced by pattern as a second line of defence;
+  * httpx/httpcore request logging is lowered to WARNING (volume, not secrecy).
+
+Not covered: bytes written straight to file descriptors 1/2 (C extensions, child
+processes that inherit the descriptors). The package's Claude CLI child runs on
+pipes, not on the unit's stdout.
+"""
+
+import atexit
+import logging
+import os
+import re
+import sys
+
+TOKEN_RE = re.compile(r"\d+:[A-Za-z0-9_-]{30,40}")  # bounded: glued text must not eat the next token
+MASK = "<TOKEN>"
+
+
+def _secrets() -> list[str]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return []
+    found = [token]
+    secret = token.split(":", 1)[-1]
+    if len(secret) >= 20 and secret != token:
+        found.append(secret)
+    return found
+
+
+def mask(text: str, secrets: list[str] | None = None) -> str:
+    for secret in _secrets() if secrets is None else secrets:
+        text = text.replace(secret, MASK)
+    return TOKEN_RE.sub(MASK, text)
+
+
+class MaskingStream:
+    """Text stream proxy that masks tokens line by line.
+
+    Output is held until a newline so a token split across write() calls -- even
+    with a flush() in between -- is still seen whole. An unterminated tail is
+    released at exit (atexit); past PENDING_CAP all but its last KEEP chars go out. The binary
+    .buffer goes through the same masking.
+    """
+
+    PENDING_CAP = 65536
+    KEEP = 256  # longer than any bot token
+
+    def __init__(self, stream, secrets: list[str]) -> None:  # type: ignore[no-untyped-def]
+        self._stream = stream
+        self._secrets = secrets
+        self._pending = ""
+        self.buffer = _MaskingBuffer(self)
+
+    def write(self, text: str) -> int:
+        self._pending += text
+        head, sep, tail = self._pending.rpartition("\n")
+        if sep:
+            self._stream.write(mask(head + sep, self._secrets))
+            self._pending = tail
+        if len(self._pending) > self.PENDING_CAP:
+            # Mask with full context, then keep the last KEEP chars held: a token
+            # cut at the end of the buffer lies there and is completed later.
+            masked = mask(self._pending, self._secrets)
+            self._stream.write(masked[: -self.KEEP])
+            self._pending = masked[-self.KEEP :]
+        return len(text)
+
+    def writelines(self, lines) -> None:  # type: ignore[no-untyped-def]
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        # The unterminated tail stays held: it may be the first half of a token.
+        self._stream.flush()
+
+    def release(self) -> None:
+        if self._pending:
+            self._stream.write(mask(self._pending, self._secrets))
+            self._pending = ""
+        self._stream.flush()
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._stream, name)
+
+
+class _MaskingBuffer:
+    """Binary side of MaskingStream: bytes are decoded and masked with the text."""
+
+    def __init__(self, owner: MaskingStream) -> None:
+        self._owner = owner
+
+    def write(self, data) -> int:  # type: ignore[no-untyped-def]
+        encoding = getattr(self._owner._stream, "encoding", None) or "utf-8"
+        self._owner.write(bytes(data).decode(encoding, errors="replace"))
+        return len(data)
+
+    def writelines(self, lines) -> None:  # type: ignore[no-untyped-def]
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        self._owner.flush()
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._owner._stream.buffer, name)
+
+
+def install() -> None:
+    secrets = _secrets()
+    sys.stdout = MaskingStream(sys.stdout, secrets)
+    sys.stderr = MaskingStream(sys.stderr, secrets)
+    atexit.register(sys.stderr.release)
+    atexit.register(sys.stdout.release)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+if __name__ == "__main__":
+    install()
+    from src.main import run
+
+    run()

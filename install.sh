@@ -1331,6 +1331,14 @@ install_richard() {
         die "Richard install did not produce 'claude-telegram-bot' binary in ${venv}/bin/."
     fi
 
+    # Launcher that masks the bot token in every log line: httpx logs the
+    # api.telegram.org/bot<TOKEN>/... URL at INFO and the unit sends stdout to
+    # journald. Kept outside site-packages, so a pip upgrade does not undo it.
+    [[ -f "${TEMPLATES_DIR}/richard-launch.py" ]] || die "Template not found: ${TEMPLATES_DIR}/richard-launch.py"
+    install -d -m 0755 -o root -g root "${RICHARD_HOME}/launch"
+    install -m 0644 -o root -g root "${TEMPLATES_DIR}/richard-launch.py" \
+        "${RICHARD_HOME}/launch/richard_launch.py"
+
     # .env
     local env_tmp
     env_tmp=$(mktemp)
