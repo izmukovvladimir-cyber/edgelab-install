@@ -10,8 +10,9 @@ claude-code-telegram does not undo it:
   * sys.stdout and sys.stderr are wrapped before the package starts, so every
     Python-level write is masked at the output boundary: logging handlers
     (basicConfig binds the wrapped stream), print(), sys.excepthook,
-    threading.excepthook, sys.unraisablehook, sys.exit(<message>), and the
-    binary sys.stdout.buffer / sys.stderr.buffer;
+    threading.excepthook, sys.unraisablehook, sys.exit(<message>),
+    sys.__stdout__ / sys.__stderr__, and the binary sys.stdout.buffer /
+    sys.stderr.buffer (write, write1, raw);
   * the configured token (TELEGRAM_BOT_TOKEN) is replaced exactly, and anything
     shaped like a bot token is replaced by pattern as a second line of defence;
   * httpx/httpcore request logging is lowered to WARNING (volume, not secrecy).
@@ -22,6 +23,7 @@ pipes, not on the unit's stdout.
 """
 
 import atexit
+import codecs
 import logging
 import os
 import re
@@ -103,11 +105,19 @@ class _MaskingBuffer:
 
     def __init__(self, owner: MaskingStream) -> None:
         self._owner = owner
+        encoding = getattr(owner._stream, "encoding", None) or "utf-8"
+        # Incremental: a multibyte character split across write() calls stays intact.
+        self._decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
 
     def write(self, data) -> int:  # type: ignore[no-untyped-def]
-        encoding = getattr(self._owner._stream, "encoding", None) or "utf-8"
-        self._owner.write(bytes(data).decode(encoding, errors="replace"))
+        self._owner.write(self._decoder.decode(bytes(data)))
         return len(data)
+
+    write1 = write  # BufferedWriter.write1 must not reach the raw stream unmasked
+
+    @property
+    def raw(self) -> "_MaskingBuffer":
+        return self
 
     def writelines(self, lines) -> None:  # type: ignore[no-untyped-def]
         for line in lines:
@@ -124,6 +134,9 @@ def install() -> None:
     secrets = _secrets()
     sys.stdout = MaskingStream(sys.stdout, secrets)
     sys.stderr = MaskingStream(sys.stderr, secrets)
+    # print(..., file=sys.__stderr__) is Python-level output too.
+    sys.__stdout__ = sys.stdout
+    sys.__stderr__ = sys.stderr
     atexit.register(sys.stderr.release)
     atexit.register(sys.stdout.release)
     for name in ("httpx", "httpcore"):

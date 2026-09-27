@@ -557,6 +557,9 @@ def run():
     sys.stderr.buffer.write(("tail " + t).encode())
     sys.stdout.write("x" * 70000 + t[:12]); sys.stdout.write(t[12:] + "\n")            # past PENDING_CAP
     sys.stderr.buffer.write(("y" * 70000 + t[:12]).encode()); sys.stderr.buffer.write((t[12:] + "\n").encode())
+    sys.stdout.buffer.write1(("write1 " + t + "\n").encode()); sys.stdout.buffer.raw.write(("raw " + t + "\n").encode())
+    print("dunder", t, file=sys.__stderr__)
+    sys.stdout.buffer.write("utf \u0436".encode()[:-1]); sys.stdout.buffer.write("utf \u0436".encode()[-1:] + b" UTF-OK\n")
     th =threading.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError(t)))
     th.start(); th.join()
     import atexit
@@ -579,6 +582,7 @@ for CASE in "${TOKEN}|${TOKEN}|configured" "${SHORT_TOKEN}|${SHORT_TOKEN}|short-
     check "richard launcher [${NAME}]: mask visible"     bash -c 'test "$(grep -c "<TOKEN>" "$1")" -ge 8' _ "$LOGOUT"
     check "richard launcher [${NAME}]: httpx quiet"      bash -c '! grep -q QUIET-MARK "$1"' _ "$LOGOUT"
     check "richard launcher [${NAME}]: tail released"    grep -qF "last <TOKEN>" "$LOGOUT"
+    check "richard launcher [${NAME}]: split utf-8 intact" grep -qF "utf ж UTF-OK" "$LOGOUT"
 done
 unset -f sudo install
 
