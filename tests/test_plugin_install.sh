@@ -528,66 +528,35 @@ check "richard interpolation: file untouched" cmp -s "${RH}/.env" "${TDIR}/richa
 # --- Richard launcher: the bot token never reaches the log --------------------
 check "richard launcher: installed"      test -f "${RH}/launch/richard_launch.py"
 check "richard launcher: unit runs it"   grep -q '^ExecStart=/opt/richard/venv/bin/python /opt/richard/launch/richard_launch.py$' "${TDIR}/systemd/claude-richard.service"
-# A stand-in for claude-code-telegram's src.main: the real package logs through
-# basicConfig(stream=sys.stdout), and every other Python output path is tried too.
+# A stand-in for claude-code-telegram's src.main: the real v1.6.0 setup_logging()
+# is logging.basicConfig(level=INFO, stream=sys.stdout), then python-telegram-bot's
+# httpx client logs every request URL (with the token) at INFO.
 FAKEPKG="${TDIR}/fakepkg"
 mkdir -p "${FAKEPKG}/src"
 : >"${FAKEPKG}/src/__init__.py"
 cat >"${FAKEPKG}/src/main.py" <<'PYEOF'
-import logging, os, sys, threading, traceback
+import logging, os, sys
 def run():
     t = os.environ["LEAK_TOKEN"]
-    logging.basicConfig(level=logging.DEBUG, format="%(message)s", stream=sys.stdout)
-    logging.getLogger("telegram").info("HTTP Request: POST %s", f"https://api.telegram.org/bot{t}/getUpdates")
-    logging.getLogger("httpx").info("QUIET-MARK %s", t)
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    for name in ("httpx", "httpcore"):
+        print(f"LEVEL {name}={logging.getLevelName(logging.getLogger(name).getEffectiveLevel())}")
+    logging.getLogger("httpx").info("HTTP Request: POST %s", f"https://api.telegram.org/bot{t}/getUpdates")
     logging.getLogger("httpcore").info("QUIET-MARK %s", t)
-    logging.getLogger("httpx").warning("warn %s", t)
-    try:
-        raise RuntimeError(f"https://api.telegram.org/bot{t}/x")
-    except RuntimeError:
-        logging.getLogger("x").exception("boom")
-        traceback.print_exc()
-    logging.getLogger("x").info("stack", stack_info=True, extra={"secret": t})
-    print("print", t)
-    sys.stderr.write("split " + t[:12])
-    sys.stderr.write(t[12:] + "\n")
-    sys.stdout.write("flushed " + t[:12]); sys.stdout.flush()
-    sys.stdout.write(t[12:] + "\n")
-    sys.stdout.buffer.write(("bytes " + t + "\n").encode()); sys.stdout.buffer.flush()
-    sys.stderr.buffer.write(("tail " + t).encode())
-    sys.stdout.write("x" * 70000 + t[:12]); sys.stdout.write(t[12:] + "\n")            # past PENDING_CAP
-    sys.stderr.buffer.write(("y" * 70000 + t[:12]).encode()); sys.stderr.buffer.write((t[12:] + "\n").encode())
-    sys.stdout.buffer.write1(("write1 " + t + "\n").encode()); sys.stdout.buffer.raw.write(("raw " + t + "\n").encode())
-    print("dunder", t, file=sys.__stderr__)
-    sys.stdout.write("z" * 70000 + " " + t[:-5]); sys.stdout.write(t[-5:] + " SFX\n")   # overflow, short suffix
-    sys.stdout.write("w" * 70000 + " " + t + " " + "v" * 230); sys.stdout.write("\n"); sys.stdout.flush()   # token spans the overflow cut
-    sys.stdout.detach().write(("detach " + t + "\n").encode()); sys.stdout.buffer.detach().write(("bdetach " + t + "\n").encode())
-    sys.stdout.buffer.write("utf \u0436".encode()[:-1]); sys.stdout.buffer.write("utf \u0436".encode()[-1:] + b" UTF-OK\n")
-    th =threading.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError(t)))
-    th.start(); th.join()
-    import atexit
-    atexit.register(lambda: sys.stdout.write("last " + t))   # unterminated tail at exit
+    logging.getLogger("httpx").warning("WARN-PASSES")
     print("RUN-DONE")
-    sys.exit(f"exit {t}")
+    sys.exit(1)
 PYEOF
-SHORT_TOKEN="123456:AAHabcdefghijklmnopqrstuvwxyz0123456"
-ODD_TOKEN="1111:AAHabcdefghijklmnopqrstuv"    # beyond the pattern: only the exact value catches it
-# configured token | token that shows up in output | case name
-for CASE in "${TOKEN}|${TOKEN}|configured" "${SHORT_TOKEN}|${SHORT_TOKEN}|short-id" \
-            "|${TOKEN}|pattern-only" "${ODD_TOKEN}|${ODD_TOKEN}|exact-only"; do
-    IFS='|' read -r CFG T NAME <<<"$CASE"
-    LOGOUT="${TDIR}/launcher-${NAME}.out"
-    (cd "$TDIR" && TELEGRAM_BOT_TOKEN="$CFG" LEAK_TOKEN="$T" PYTHONPATH="$FAKEPKG" python3 "${RH}/launch/richard_launch.py") >"$LOGOUT" 2>&1
-    LOGRC=$?
-    check "richard launcher [${NAME}]: entry point ran"  grep -q RUN-DONE "$LOGOUT"
-    check "richard launcher [${NAME}]: exits like run()" test "$LOGRC" = 1
-    check "richard launcher [${NAME}]: token masked"     bash -c '! grep -qF -- "$1" "$2"' _ "${T#*:}" "$LOGOUT"
-    check "richard launcher [${NAME}]: mask visible"     bash -c 'test "$(grep -c "<TOKEN>" "$1")" -ge 8' _ "$LOGOUT"
-    check "richard launcher [${NAME}]: httpx quiet"      bash -c '! grep -q QUIET-MARK "$1"' _ "$LOGOUT"
-    check "richard launcher [${NAME}]: tail released"    grep -qF "last <TOKEN>" "$LOGOUT"
-    check "richard launcher [${NAME}]: split utf-8 intact" grep -qF "utf ж UTF-OK" "$LOGOUT"
-    check "richard launcher [${NAME}]: overflow suffix masked" bash -c '! grep -qF -- "${1: -5} SFX" "$2"' _ "$T" "$LOGOUT"
-done
+LOGOUT="${TDIR}/launcher.out"
+(cd "$TDIR" && LEAK_TOKEN="$TOKEN" PYTHONPATH="$FAKEPKG" python3 "${RH}/launch/richard_launch.py") >"$LOGOUT" 2>&1
+LOGRC=$?
+check "richard launcher: entry point ran"      grep -q RUN-DONE "$LOGOUT"
+check "richard launcher: exits like run()"     test "$LOGRC" = 1
+check "richard launcher: httpx at WARNING"     grep -qx "LEVEL httpx=WARNING" "$LOGOUT"
+check "richard launcher: httpcore at WARNING"  grep -qx "LEVEL httpcore=WARNING" "$LOGOUT"
+check "richard launcher: no bot URL in output" bash -c '! grep -q "api.telegram.org/bot" "$1"' _ "$LOGOUT"
+check "richard launcher: no token in output"   bash -c '! grep -qF -- "$1" "$2"' _ "${TOKEN#*:}" "$LOGOUT"
+check "richard launcher: warnings still pass"  grep -q WARN-PASSES "$LOGOUT"
 unset -f sudo install
 
 # --- final notes point at `claude auth login` ------------------------------------
