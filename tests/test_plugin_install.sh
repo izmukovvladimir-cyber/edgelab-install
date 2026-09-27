@@ -524,6 +524,39 @@ printf 'TELEGRAM_BOT_TOKEN=%s\nLOCAL_ROOT=/srv/richard\nAPPROVED_DIRECTORY=${LOC
 cp "${RH}/.env" "${TDIR}/richard-interp.orig"
 install_richard >/dev/null 2>&1
 check "richard interpolation: file untouched" cmp -s "${RH}/.env" "${TDIR}/richard-interp.orig"
+
+# --- Richard launcher: the bot token never reaches the log --------------------
+check "richard launcher: installed"      test -f "${RH}/launch/richard_launch.py"
+check "richard launcher: unit runs it"   grep -q '^ExecStart=/opt/richard/venv/bin/python /opt/richard/launch/richard_launch.py$' "${TDIR}/systemd/claude-richard.service"
+# A stand-in for claude-code-telegram's src.main: the real v1.6.0 setup_logging()
+# is logging.basicConfig(level=INFO, stream=sys.stdout), then python-telegram-bot's
+# httpx client logs every request URL (with the token) at INFO.
+FAKEPKG="${TDIR}/fakepkg"
+mkdir -p "${FAKEPKG}/src"
+: >"${FAKEPKG}/src/__init__.py"
+cat >"${FAKEPKG}/src/main.py" <<'PYEOF'
+import logging, os, sys
+def run():
+    t = os.environ["LEAK_TOKEN"]
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    for name in ("httpx", "httpcore"):
+        print(f"LEVEL {name}={logging.getLevelName(logging.getLogger(name).getEffectiveLevel())}")
+    logging.getLogger("httpx").info("HTTP Request: POST %s", f"https://api.telegram.org/bot{t}/getUpdates")
+    logging.getLogger("httpcore").info("QUIET-MARK %s", t)
+    logging.getLogger("httpx").warning("WARN-PASSES")
+    print("RUN-DONE")
+    sys.exit(1)
+PYEOF
+LOGOUT="${TDIR}/launcher.out"
+(cd "$TDIR" && LEAK_TOKEN="$TOKEN" PYTHONPATH="$FAKEPKG" python3 "${RH}/launch/richard_launch.py") >"$LOGOUT" 2>&1
+LOGRC=$?
+check "richard launcher: entry point ran"      grep -q RUN-DONE "$LOGOUT"
+check "richard launcher: exits like run()"     test "$LOGRC" = 1
+check "richard launcher: httpx at WARNING"     grep -qx "LEVEL httpx=WARNING" "$LOGOUT"
+check "richard launcher: httpcore at WARNING"  grep -qx "LEVEL httpcore=WARNING" "$LOGOUT"
+check "richard launcher: no bot URL in output" bash -c '! grep -q "api.telegram.org/bot" "$1"' _ "$LOGOUT"
+check "richard launcher: no token in output"   bash -c '! grep -qF -- "$1" "$2"' _ "${TOKEN#*:}" "$LOGOUT"
+check "richard launcher: warnings still pass"  grep -q WARN-PASSES "$LOGOUT"
 unset -f sudo install
 
 # --- final notes point at `claude auth login` ------------------------------------

@@ -11,7 +11,8 @@ WorkingDirectory=/opt/richard
 EnvironmentFile=/opt/richard/.env
 Environment=HOME=/home/{{USER}}
 Environment=PATH=/home/{{USER}}/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/opt/richard/venv/bin/claude-telegram-bot
+# The launcher masks the bot token in logs before starting claude-telegram-bot.
+ExecStart=/opt/richard/venv/bin/python /opt/richard/launch/richard_launch.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
