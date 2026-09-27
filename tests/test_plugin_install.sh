@@ -559,6 +559,9 @@ def run():
     sys.stderr.buffer.write(("y" * 70000 + t[:12]).encode()); sys.stderr.buffer.write((t[12:] + "\n").encode())
     sys.stdout.buffer.write1(("write1 " + t + "\n").encode()); sys.stdout.buffer.raw.write(("raw " + t + "\n").encode())
     print("dunder", t, file=sys.__stderr__)
+    sys.stdout.write("z" * 70000 + " " + t[:-5]); sys.stdout.write(t[-5:] + " SFX\n")   # overflow, short suffix
+    sys.stdout.write("w" * 70000 + " " + t + " " + "v" * 230); sys.stdout.write("\n"); sys.stdout.flush()   # token spans the overflow cut
+    sys.stdout.detach().write(("detach " + t + "\n").encode()); sys.stdout.buffer.detach().write(("bdetach " + t + "\n").encode())
     sys.stdout.buffer.write("utf \u0436".encode()[:-1]); sys.stdout.buffer.write("utf \u0436".encode()[-1:] + b" UTF-OK\n")
     th =threading.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError(t)))
     th.start(); th.join()
@@ -583,6 +586,7 @@ for CASE in "${TOKEN}|${TOKEN}|configured" "${SHORT_TOKEN}|${SHORT_TOKEN}|short-
     check "richard launcher [${NAME}]: httpx quiet"      bash -c '! grep -q QUIET-MARK "$1"' _ "$LOGOUT"
     check "richard launcher [${NAME}]: tail released"    grep -qF "last <TOKEN>" "$LOGOUT"
     check "richard launcher [${NAME}]: split utf-8 intact" grep -qF "utf ж UTF-OK" "$LOGOUT"
+    check "richard launcher [${NAME}]: overflow suffix masked" bash -c '! grep -qF -- "${1: -5} SFX" "$2"' _ "$T" "$LOGOUT"
 done
 unset -f sudo install
 

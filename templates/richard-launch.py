@@ -12,7 +12,7 @@ claude-code-telegram does not undo it:
     (basicConfig binds the wrapped stream), print(), sys.excepthook,
     threading.excepthook, sys.unraisablehook, sys.exit(<message>),
     sys.__stdout__ / sys.__stderr__, and the binary sys.stdout.buffer /
-    sys.stderr.buffer (write, write1, raw);
+    sys.stderr.buffer (write, write1, raw, detach);
   * the configured token (TELEGRAM_BOT_TOKEN) is replaced exactly, and anything
     shaped like a bot token is replaced by pattern as a second line of defence;
   * httpx/httpcore request logging is lowered to WARNING (volume, not secrecy).
@@ -75,11 +75,21 @@ class MaskingStream:
             self._stream.write(mask(head + sep, self._secrets))
             self._pending = tail
         if len(self._pending) > self.PENDING_CAP:
-            # Mask with full context, then keep the last KEEP chars held: a token
-            # cut at the end of the buffer lies there and is completed later.
-            masked = mask(self._pending, self._secrets)
-            self._stream.write(masked[: -self.KEEP])
-            self._pending = masked[-self.KEEP :]
+            # Release all but the last KEEP chars and hold those RAW: a token cut at
+            # the end is completed and masked whole later. A whole token spanning the
+            # cut moves the cut to its start.
+            pending = self._pending
+            cut = len(pending) - self.KEEP
+            spans = [m.span() for m in TOKEN_RE.finditer(pending, max(0, cut - self.KEEP))]
+            for secret in self._secrets:
+                at = pending.find(secret, max(0, cut - len(secret)))
+                if at != -1:
+                    spans.append((at, at + len(secret)))
+            for start, end in spans:
+                if start < cut < end:
+                    cut = min(cut, start)
+            self._stream.write(mask(pending[:cut], self._secrets))
+            self._pending = pending[cut:]
         return len(text)
 
     def writelines(self, lines) -> None:  # type: ignore[no-untyped-def]
@@ -89,6 +99,10 @@ class MaskingStream:
     def flush(self) -> None:
         # The unterminated tail stays held: it may be the first half of a token.
         self._stream.flush()
+
+    def detach(self) -> "_MaskingBuffer":
+        # Detaching must not hand out the unmasked binary stream.
+        return self.buffer
 
     def release(self) -> None:
         if self._pending:
@@ -114,6 +128,9 @@ class _MaskingBuffer:
         return len(data)
 
     write1 = write  # BufferedWriter.write1 must not reach the raw stream unmasked
+
+    def detach(self) -> "_MaskingBuffer":
+        return self
 
     @property
     def raw(self) -> "_MaskingBuffer":
