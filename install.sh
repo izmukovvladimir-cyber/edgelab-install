@@ -1388,6 +1388,51 @@ install_richard() {
 # STEP 8: GLOBAL ~/.claude/ (OAuth creds live here, shared by Jarvis + Richard)
 # =============================================================================
 
+# Starter agent rules: one source, templates/AGENT-RULES-STARTER.md, appended
+# to the global CLAUDE.md between these markers (fresh install and re-run alike).
+readonly STARTER_RULES_BEGIN='<!-- agent-rules-starter:begin -->'
+readonly STARTER_RULES_END='<!-- agent-rules-starter:end -->'
+# Phrase of rule 4; a file that already has it carries the rules in some form.
+readonly STARTER_RULES_PROBE='Понял так'
+
+# _starter_rules_block -- prints the starter rules wrapped in the markers.
+_starter_rules_block() {
+    local src="${TEMPLATES_DIR}/AGENT-RULES-STARTER.md"
+    [[ -f "$src" ]] || die "Template not found: $src"
+    printf '\n%s\n' "$STARTER_RULES_BEGIN"
+    cat "$src"
+    printf '%s\n' "$STARTER_RULES_END"
+}
+
+# ensure_starter_rules FILE -- for an already installed global CLAUDE.md:
+# appends the starter rules when the file has neither the markers nor the
+# rule-4 phrase. Backs the file up first and never rewrites the owner's text.
+# Idempotent: a re-run finds the markers and does nothing.
+ensure_starter_rules() {
+    local dst
+    dst=$(readlink -f -- "$1") || return 0
+    [[ -f "$dst" ]] || return 0
+    if grep -qF -- "$STARTER_RULES_BEGIN" "$dst" || grep -qF -- "$STARTER_RULES_PROBE" "$dst"; then
+        return 0
+    fi
+
+    local tmp bak mode
+    tmp=$(mktemp)
+    TMPFILES+=("$tmp")
+    cat -- "$dst" > "$tmp"
+    # Keep the owner's last line intact when the file lacks a final newline.
+    if [[ -s "$tmp" && -n "$(tail -c1 "$tmp")" ]]; then
+        printf '\n' >> "$tmp"
+    fi
+    _starter_rules_block >> "$tmp"
+
+    bak="${dst}.bak-$(date +%Y%m%d-%H%M%S)-starter-rules"
+    cp -p -- "$dst" "$bak" || die "Cannot back up ${dst}; starter rules not added."
+    mode=$(stat -c '%a' -- "$dst")
+    write_as_user "$tmp" "$dst" "$mode"
+    ok "Starter rules appended to ${dst} (backup: ${bak})."
+}
+
 setup_global_claude() {
     step 8 "Setting up ${EDGELAB_HOME}/.claude/ (shared OAuth dir)"
 
@@ -1442,7 +1487,10 @@ SJEOF
             TG_ID      "$TG_USER_ID" \
             LANGUAGE   "$OPERATOR_LANGUAGE" \
             TIMEZONE   "$OPERATOR_TIMEZONE"
+        _starter_rules_block >> "$tmp"
         write_as_user "$tmp" "$global_claude_md" 0644
+    else
+        ensure_starter_rules "$global_claude_md"
     fi
 
     fix_owner "$claude_dir"
