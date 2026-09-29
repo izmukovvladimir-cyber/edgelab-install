@@ -1055,6 +1055,8 @@ out = [
     "# TELEGRAM_ALLOWED_CHAT_IDS must contain your id too: without it every private",
     "# message is dropped silently. Voice needs GROQ_API_KEY=<key> (optional).",
     "# TELEGRAM_EXPECTED_BOT_ID is set at every start from the token (channel-start.sh).",
+    "# Permission prompts (\"allow this command?\") go ONLY to TELEGRAM_ALLOWED_USER_IDS,",
+    "# the owner: never put someone else's id there. Without it the plugin refuses to start.",
 ]
 out += [f"{k}={v}" for k, v in managed.items()]
 # The expected bot id is only the token prefix; channel-start.sh derives it
@@ -1905,6 +1907,7 @@ $(printf '%b' "$C_BOLD")NEXT STEPS -- these are for the root-Claude agent, not t
         # Jarvis: ${JARVIS_ENV_DIR}/channel.env --
         #   TELEGRAM_BOT_TOKEN=<token>, and your id in BOTH
         #   TELEGRAM_ALLOWED_USER_IDS=<id> and TELEGRAM_ALLOWED_CHAT_IDS=<id>
+        #   Permission prompts ("allow this command?") go only to TELEGRAM_ALLOWED_USER_IDS
         # Richard: ${RICHARD_HOME}/.env -- TELEGRAM_BOT_TOKEN=..., ALLOWED_USERS=<id>
 
         sudo systemctl enable ${JARVIS_UNIT} claude-richard

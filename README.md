@@ -45,6 +45,7 @@ Telegram --> Bot API --> dashi-plugin (MCP-канал) --> Claude Code --> от�
    - `TELEGRAM_BOT_TOKEN=<токен бота>`
    - Свой Telegram user ID (из [@userinfobot](https://t.me/userinfobot)) впишите в ОБЕ строки:
      `TELEGRAM_ALLOWED_USER_IDS=<id>` и `TELEGRAM_ALLOWED_CHAT_IDS=<id>` (без второй бот молча не видит личку)
+   - Вопросы «разрешить команду?» (permission relay) получает только владелец: плагин берёт их адресатов из `TELEGRAM_ALLOWED_USER_IDS`. Не вписывайте туда чужие ID. Без `TELEGRAM_ALLOWED_USER_IDS` плагин не запустится (встроенного ID владельца в нём нет).
 
 3. **Запустите агента**:
    ```bash
