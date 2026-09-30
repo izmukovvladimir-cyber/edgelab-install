@@ -1040,6 +1040,14 @@ managed = {
     "TELEGRAM_WEBHOOK_HOST": existing.get("TELEGRAM_WEBHOOK_HOST") or "127.0.0.1",
     "TELEGRAM_WEBHOOK_PORT": existing.get("TELEGRAM_WEBHOOK_PORT") or "8089",
 }
+# "Allow this command?" prompts: pinned to the owner (the first id), so team
+# members added to TELEGRAM_ALLOWED_USER_IDS later by hand never get them.
+# A new owner answer re-pins; otherwise the pinned value is kept.
+new_ids = csv(user_ids_new)
+perm_ids = new_ids[0] if new_ids else (
+    existing.get("TELEGRAM_PERMISSION_ALLOWED_USER_IDS", "") or (user_ids[0] if user_ids else ""))
+if perm_ids:
+    managed["TELEGRAM_PERMISSION_ALLOWED_USER_IDS"] = perm_ids
 if groq:
     managed["GROQ_API_KEY"] = groq
 
@@ -1055,8 +1063,10 @@ out = [
     "# TELEGRAM_ALLOWED_CHAT_IDS must contain your id too: without it every private",
     "# message is dropped silently. Voice needs GROQ_API_KEY=<key> (optional).",
     "# TELEGRAM_EXPECTED_BOT_ID is set at every start from the token (channel-start.sh).",
-    "# Permission prompts (\"allow this command?\") go ONLY to TELEGRAM_ALLOWED_USER_IDS,",
-    "# the owner: never put someone else's id there. Without it the plugin refuses to start.",
+    "# Permission prompts (\"allow this command?\") go ONLY to the owner:",
+    "# TELEGRAM_PERMISSION_ALLOWED_USER_IDS is set once to the first id and kept, so",
+    "# team members you add to TELEGRAM_ALLOWED_USER_IDS later never get them.",
+    "# Without TELEGRAM_ALLOWED_USER_IDS the plugin refuses to start.",
 ]
 out += [f"{k}={v}" for k, v in managed.items()]
 # The expected bot id is only the token prefix; channel-start.sh derives it

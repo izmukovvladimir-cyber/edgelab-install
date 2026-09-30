@@ -104,6 +104,22 @@ check "rerun: new token wins"           has "$ENV3" "TELEGRAM_BOT_TOKEN=${TOKEN2
 check "rerun: new user id wins"         has "$ENV3" "TELEGRAM_ALLOWED_USER_IDS=999"
 check "rerun: new id added to chats"    has "$ENV3" "TELEGRAM_ALLOWED_CHAT_IDS=-100777,999"
 
+# --- channel.env: permission prompts pinned to the owner ------------------------
+check "perm: fresh pinned to owner"     has "$ENV1" "TELEGRAM_PERMISSION_ALLOWED_USER_IDS=555"
+check "perm: empty answers, no line"    hasnt "$ENV0" '^TELEGRAM_PERMISSION_ALLOWED_USER_IDS='
+check "perm: rerun pins existing owner" has "$ENV2" "TELEGRAM_PERMISSION_ALLOWED_USER_IDS=555"
+check "perm: new owner answer re-pins"  has "$ENV3" "TELEGRAM_PERMISSION_ALLOWED_USER_IDS=999"
+TEAM="${TDIR}/team"
+printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_ALLOWED_USER_IDS=555,777\nTELEGRAM_ALLOWED_CHAT_IDS=555,777\nTELEGRAM_PERMISSION_ALLOWED_USER_IDS=555\n' "$TOKEN" >"$TEAM"
+ENV6="${TDIR}/env6"
+CHANNEL_ENV_TOKEN="" render_channel_env "$TEAM" "" "" /st /ws >"$ENV6"
+check "perm: team member added, owner kept" has "$ENV6" "TELEGRAM_PERMISSION_ALLOWED_USER_IDS=555"
+check "perm: team member stays allowed" has "$ENV6" "TELEGRAM_ALLOWED_USER_IDS=555,777"
+check "perm: exactly one perm line"     test "$(grep -c '^TELEGRAM_PERMISSION_ALLOWED_USER_IDS=' "$ENV6")" -eq 1
+ENV7="${TDIR}/env7"
+CHANNEL_ENV_TOKEN="" render_channel_env "$TEAM" "999" "" /st /ws >"$ENV7"
+check "perm: owner answer overrides pin" has "$ENV7" "TELEGRAM_PERMISSION_ALLOWED_USER_IDS=999"
+
 # --- channel.env: groq key from file -------------------------------------------
 printf 'gsk_test123\n' >"${TDIR}/groq"
 ENV4="${TDIR}/env4"
