@@ -185,3 +185,13 @@ EOF
     [[ "$output" == *"real directory"* ]]
     [ ! -L "$TDIR/plugin-root/.claude/skills" ]
 }
+
+@test "1635: quick-reminders accepts the time forms SKILL.md advertises" {
+    script="$BATS_TEST_DIRNAME/../skills/quick-reminders/scripts/create.sh"
+    expr=$(grep -o "sed -E '[^']*'" "$script" | head -1)
+    [ -n "$expr" ]
+    for t in "in 10m" "in 2h" "in 3d" "in 2 minutes" "tomorrow 9am"; do
+        n=$(printf '%s' "$t" | eval "$expr")
+        date -d "$n" +%s >/dev/null
+    done
+}

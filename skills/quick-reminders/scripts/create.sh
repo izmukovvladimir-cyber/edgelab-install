@@ -12,7 +12,9 @@ TIMESPEC="$1"
 shift
 MESSAGE="$*"
 
-if ! TARGET_EPOCH=$(date -d "$TIMESPEC" +%s 2>/dev/null); then
+# GNU date rejects "in 10 minutes" and "10m"; normalise the forms SKILL.md advertises.
+TIMESPEC_NORM=$(printf '%s' "$TIMESPEC" | sed -E 's/^in +/+/; s/^\+?([0-9]+) *m$/+\1 minutes/; s/^\+?([0-9]+) *h$/+\1 hours/; s/^\+?([0-9]+) *d$/+\1 days/')
+if ! TARGET_EPOCH=$(date -d "$TIMESPEC_NORM" +%s 2>/dev/null); then
     echo "error: cannot parse timespec '${TIMESPEC}'" >&2
     exit 1
 fi
