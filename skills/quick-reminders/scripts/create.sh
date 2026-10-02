@@ -30,25 +30,22 @@ MON=$(date -d "@${TARGET_EPOCH}" +%m)
 
 # One-shot: run at specific minute/hour/day/month, then remove its own cron line.
 NONCE=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
-GATEWAY_DIR="${HOME}/claude-gateway"
-TOKEN_FILE="${GATEWAY_DIR}/secrets/bot-token"
-CONFIG_FILE="${GATEWAY_DIR}/config.json"
+# Token source and owner id: see tg-target.sh (channel.env from edgelab-install,
+# then the old gateway path). The token is read by the cron line at run time.
+# shellcheck source=tg-target.sh
+source "$(dirname "${BASH_SOURCE[0]}")/tg-target.sh"
+tg_resolve_target || exit 1
+TOKEN_CMD=$(tg_token_cmd) || exit 1
 
-if [[ ! -r "$TOKEN_FILE" ]]; then
-    echo "error: bot token not found at ${TOKEN_FILE}" >&2
-    exit 1
-fi
-
-TG_ID=$(jq -r '.allowlist_user_ids[0] // empty' "$CONFIG_FILE" 2>/dev/null || true)
 if [[ -z "$TG_ID" ]]; then
-    echo "error: no Telegram ID configured in ${CONFIG_FILE}" >&2
+    echo "error: no Telegram ID (set TELEGRAM_CHAT_ID or TELEGRAM_ALLOWED_USER_IDS in channel.env)" >&2
     exit 1
 fi
 
 # Escape message for cron line (no newlines, no unescaped quotes)
 SAFE_MSG=$(printf '%s' "$MESSAGE" | tr '\n' ' ' | sed 's/"/\\"/g')
 
-CRON_LINE="${MIN} ${HOUR} ${DAY} ${MON} * TOKEN=\$(cat ${TOKEN_FILE}) && curl -fsSL --max-time 30 -d \"chat_id=${TG_ID}\" -d \"text=${SAFE_MSG}\" \"https://api.telegram.org/bot\${TOKEN}/sendMessage\" >/dev/null 2>&1; (crontab -l 2>/dev/null | grep -vF 'qr:ID=${NONCE}') | crontab - # qr:ID=${NONCE}"
+CRON_LINE="${MIN} ${HOUR} ${DAY} ${MON} * TOKEN=\$(${TOKEN_CMD}) && curl -fsSL --max-time 30 -d \"chat_id=${TG_ID}\" -d \"text=${SAFE_MSG}\" \"https://api.telegram.org/bot\${TOKEN}/sendMessage\" >/dev/null 2>&1; (crontab -l 2>/dev/null | grep -vF 'qr:ID=${NONCE}') | crontab - # qr:ID=${NONCE}"
 
 ( crontab -l 2>/dev/null; echo "$CRON_LINE" ) | crontab -
 

@@ -40,6 +40,8 @@ readonly JARVIS_UNIT="channel-jarvis"
 readonly JARVIS_ENV_DIR="/etc/dashi-plugin/jarvis"
 readonly CHANNEL_CONFIRM_BIN="/usr/local/lib/edgelab/channel-confirm.sh"
 readonly CHANNEL_START_BIN="/usr/local/lib/edgelab/channel-start.sh"
+# Root-owned apt wrapper: the only apt path in sudoers (plain `apt-get *` = root).
+readonly APT_WRAPPER_BIN="/usr/local/sbin/edgelab-apt-install"
 # Pre-plugin Jarvis (v3.0.x). Kept on disk for --rollback, never deleted.
 readonly LEGACY_GATEWAY_UNIT="claude-gateway"
 readonly LEGACY_GATEWAY_DIR_NAME="claude-gateway"
@@ -1559,7 +1561,26 @@ install_skills() {
     fi
 
     fix_owner "$dst_parent"
+    link_skills_into_plugin "$dst_parent" "${EDGELAB_HOME}/.claude-lab/jarvis/.claude/dashi-plugin-claude-code"
     ok "Skills installed: ${installed[*]:-<none>} (${#installed[@]}/10)"
+}
+
+# link_skills_into_plugin <skills_dir> <plugin_root>
+# claude runs in <plugin_root>/plugin and takes the plugin git root as the
+# project, so <workspace>/skills is never discovered. A symlink at
+# <plugin_root>/.claude/skills attaches them. An existing real dir is kept.
+link_skills_into_plugin() {
+    local skills_dir=$1 plugin_root=$2
+    local link="${plugin_root}/.claude/skills"
+    [[ -d "$plugin_root" ]] || { warn "Plugin dir ${plugin_root} missing -- skills not linked into the session."; return 0; }
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        warn "${link} is a real directory -- left as is; skills in ${skills_dir} may not be visible to Jarvis."
+        return 0
+    fi
+    install -d -m 0755 -o "$EDGELAB_USER" -g "$EDGELAB_USER" "${plugin_root}/.claude"
+    ln -sfnT "$skills_dir" "$link"
+    chown -h "${EDGELAB_USER}:${EDGELAB_USER}" "$link" 2>/dev/null || true
+    log "Skills linked into the session: ${link} -> ${skills_dir}"
 }
 
 # =============================================================================
@@ -1629,19 +1650,15 @@ install_superpowers() {
 # STEP 11: SUDOERS (passwordless narrow-scope for agent self-repair)
 # =============================================================================
 
-install_sudoers() {
-    step 11 "Granting edgelab narrow passwordless sudo"
-
-    local sudoers_file="/etc/sudoers.d/edgelab-agents"
-    local tmp
-    tmp=$(mktemp)
-    TMPFILES+=("$tmp")
-
-    cat > "$tmp" <<SUDOERS
+# render_sudoers -- prints the sudoers file for 'edgelab' to stdout.
+# apt is NOT listed: `sudo apt-get *` takes -o APT::Update::Pre-Invoke::=<cmd>
+# and is full root. Package installs go through ${APT_WRAPPER_BIN} only.
+render_sudoers() {
+    cat <<SUDOERS
 # edgelab-install v${EDGELAB_VERSION} -- passwordless sudo for 'edgelab'.
-# Scope: systemctl + journalctl for the agent units, plus apt package mgmt.
+# Scope: systemctl + journalctl for the agent units, plus package installs
+# through ${APT_WRAPPER_BIN} (plain package names only, no apt options).
 # claude-gateway stays listed: it is the --rollback target on migrated servers.
-# (Day 1 contract: Richard can run 'sudo apt' for self-repair / package install).
 
 Cmnd_Alias EDGELAB_SYSTEMCTL = \\
     /usr/bin/systemctl start claude-gateway, \\
@@ -1675,12 +1692,21 @@ Cmnd_Alias EDGELAB_JOURNAL = \\
     /usr/bin/journalctl -u claude-richard, \\
     /usr/bin/journalctl -u claude-richard *
 
-Cmnd_Alias EDGELAB_APT = \\
-    /usr/bin/apt, /usr/bin/apt *, \\
-    /usr/bin/apt-get, /usr/bin/apt-get *
+Cmnd_Alias EDGELAB_APT = ${APT_WRAPPER_BIN}
 
 ${EDGELAB_USER} ALL=(root) NOPASSWD: EDGELAB_SYSTEMCTL, EDGELAB_JOURNAL, EDGELAB_APT
 SUDOERS
+}
+
+install_sudoers() {
+    step 11 "Granting edgelab narrow passwordless sudo"
+
+    local sudoers_file="/etc/sudoers.d/edgelab-agents"
+    local tmp
+    tmp=$(mktemp)
+    TMPFILES+=("$tmp")
+
+    render_sudoers > "$tmp"
 
     # Validate syntax before installing -- a broken sudoers can lock out sudo.
     if ! visudo -cf "$tmp" >/dev/null 2>&1; then
@@ -1688,8 +1714,13 @@ SUDOERS
         return 1
     fi
 
+    # Wrapper first: the sudoers rule must never point at a missing or
+    # user-writable file. /usr/local/sbin is root-owned.
+    install -d -m 0755 -o root -g root "$(dirname "$APT_WRAPPER_BIN")"
+    install -m 0755 -o root -g root "${TEMPLATES_DIR}/edgelab-apt-install.sh" "$APT_WRAPPER_BIN"
+
     install -m 0440 -o root -g root "$tmp" "$sudoers_file"
-    ok "Sudoers installed at ${sudoers_file} (0440)."
+    ok "Sudoers installed at ${sudoers_file} (0440), apt only via ${APT_WRAPPER_BIN}."
 }
 
 # =============================================================================
