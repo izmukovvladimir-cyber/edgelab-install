@@ -2,7 +2,7 @@
 set -euo pipefail
 # Usage: send.sh <path/to/file.html>
 # Sends the HTML file to the operator via Telegram sendDocument.
-# chat_id resolves from PRESENT_CHAT_ID env var, else gateway config.
+# chat_id resolves from PRESENT_CHAT_ID env var, else channel.env / gateway config.
 
 if [[ $# -ne 1 ]]; then
     echo "usage: $0 <file>" >&2
@@ -15,25 +15,18 @@ if [[ ! -f "$FILE" ]]; then
     exit 1
 fi
 
-GATEWAY_DIR="${HOME}/claude-gateway"
-TOKEN_FILE="${GATEWAY_DIR}/secrets/bot-token"
-CONFIG_FILE="${GATEWAY_DIR}/config.json"
-
-if [[ ! -r "$TOKEN_FILE" ]]; then
-    echo "error: bot token not found at ${TOKEN_FILE}" >&2
-    exit 1
-fi
-
+# Token source and owner id: see tg-target.sh (channel.env from edgelab-install,
+# then the old gateway path).
+# shellcheck source=tg-target.sh
+source "$(dirname "${BASH_SOURCE[0]}")/tg-target.sh"
 TG_ID="${PRESENT_CHAT_ID:-}"
-if [[ -z "$TG_ID" && -f "$CONFIG_FILE" ]]; then
-    TG_ID=$(jq -r '.allowlist_user_ids[0] // empty' "$CONFIG_FILE" 2>/dev/null || true)
-fi
+tg_resolve_target || exit 1
 if [[ -z "$TG_ID" ]]; then
-    echo "error: no chat id; set PRESENT_CHAT_ID or configure gateway allowlist" >&2
+    echo "error: no chat id; set PRESENT_CHAT_ID or TELEGRAM_ALLOWED_USER_IDS in channel.env" >&2
     exit 1
 fi
 
-TOKEN=$(cat "$TOKEN_FILE")
+TOKEN=$(tg_read_token)
 curl -fsSL --max-time 60 \
     -F "chat_id=${TG_ID}" \
     -F "document=@${FILE}" \
